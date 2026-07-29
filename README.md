@@ -58,14 +58,19 @@ to the real OS lock.
 ## Install (one command, user-space)
 
 ```bash
-cd apps/face-unlock
+# install the system prerequisites first (see below), then:
+git clone https://github.com/Yash-Sukhdeve/facelock
+cd facelock
 ./scripts/install.sh
 ```
 
 This creates an isolated venv, installs pinned deps + the `facelock` package,
 links `facelock` / `facelockd` / `facelock-guardian` into `~/.local/bin`,
 installs the config at `~/.config/facelock/config.toml` (0600), **downloads the
-SHA-pinned models**, and installs + enables the `systemd --user` units.
+SHA-pinned models**, and installs the `systemd --user` units. When run
+interactively it then **offers to enroll your face and enable** face-unlock —
+and it will **not** enable auto-start until a face is enrolled (otherwise the
+next login would lock the screen with no enrolled face able to clear it).
 
 Prerequisites (system packages, not pip):
 
@@ -107,8 +112,9 @@ written** (REQ-NF-13).
 ## (c) Run / test lock–unlock
 
 ```bash
-# start the two services (guardian first)
-systemctl --user start facelock-guardian facelockd
+# enable + start the two services. install.sh already did this if you enrolled
+# during install. ALWAYS enroll (step b) BEFORE enabling.
+systemctl --user enable --now facelock-guardian facelockd
 
 # check state / health
 facelock status
