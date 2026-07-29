@@ -1,0 +1,22 @@
+# facelock pinned runtime dependencies (REQ-NF-21/26, CST-8, user rule R5).
+#
+# Target platform (verified): Ubuntu 24.04, Python 3.11.13, CPU-only.
+# tomllib is stdlib (Python 3.11) -- no TOML dependency (ADR-5).
+# tkinter (python3-tk) is a SYSTEM package required for the shield, not a pip
+# dependency -- install it with:  sudo apt-get install python3-tk
+#
+# OpenCV provides V4L2 capture, YuNet (cv2.FaceDetectorYN), and SFace
+# (cv2.FaceRecognizerSF) -- both verified present in 4.12.0 on the target.
+# These classes live in the base opencv-python wheel (not contrib).
+
+# numpy 2.x is REQUIRED by the opencv-python 4.12 pip wheel (cp311 built against
+# numpy 2). The distro's system cv2 uses numpy 1.25, but this venv install uses
+# the pip wheel, so pin the matching numpy 2.x. (Found during M2 verification.)
+numpy==2.2.6
+opencv-python==4.12.0.88
+
+# --- Hardening (H) extras, optional; NOT required for the prototype ---------
+# The Hardening passive PAD (MiniFASNet) runs via cv2.dnn (already provided by
+# opencv-python), so no extra runtime dependency is strictly needed. onnxruntime
+# is listed only if you prefer to run PAD through ORT instead of cv2.dnn.
+# onnxruntime==1.21.0

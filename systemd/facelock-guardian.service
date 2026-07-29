@@ -1,0 +1,25 @@
+[Unit]
+Description=facelock session guardian (lock authority + watchdog)
+Documentation=man:facelock
+# The guardian is the lock authority; it must be up whenever the graphical
+# session is up, and it must come up LOCKED (SI-P2).
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=%h/.local/bin/facelock-guardian
+# Fail-closed availability (SI-P4): always restart; if the guardian misses its
+# own systemd watchdog it is killed and restarted, coming back LOCKED.
+Restart=always
+RestartSec=1
+WatchdogSec=10
+# Bounded resources (REQ-NF-06/07/08).
+CPUQuota=60%
+MemoryMax=500M
+# Least privilege (REQ-NF-27): user service, no root, no new privileges.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,106 @@
+# facelock configuration (design section 12). TOML, parsed by stdlib tomllib.
+#
+# This is the DEFAULT PROTOTYPE (P) profile: screensaver-only, no PAM, anti-
+# spoofing OFF (documentedly photo-spoofable, REQ-F-17). Copy this file to
+#   ~/.config/facelock/config.toml   (mode 0600)
+# and edit as needed. Security-critical keys (recognition.tau*, fmr_target,
+# stranger.policy, liveness.mode, security.phase, security.template_encryption)
+# ALWAYS refuse-on-invalid; a bad value there stops startup (fail-closed).
+#
+# Every key: type - default - REQ trace. Ranges are validated on load.
+
+[camera]
+device                = "/dev/video0"   # str  - V4L2 node                 REQ-F-05
+resolution            = [640, 480]      # [int,int]                        REQ-F-05, ASM-08
+pixel_format          = "YUYV"          # YUYV|MJPG                        ASM-08
+fps_active            = 15              # 1-30 - active perception rate    REQ-NF-01
+                                        # (was 5 = the ONLY fps bottleneck: the Brio does 640x480 YUYV
+                                        #  at 30fps; CAP_PROP_FPS=5 throttled it. 15 clears REQ-NF-01
+                                        #  with margin, ~0.4s unlock, active-only CPU ~25% of one core.)
+fps_idle              = 4               # 0-5  - idle/absent rate          REQ-NF-06, FM-07
+long_absence_release_s = 600           # >=30 - release camera + LED off  FM-07
+loss_grace_s          = 5               # 0-30 - lock this long after loss FM-01
+
+[detection]
+# model_path defaults to the bundled YuNet under ~/.local/share/facelock/models
+model_path            = ""              # str  - "" = bundled YuNet        REQ-F-06, FM-11
+confidence_floor      = 0.90            # 0.5-0.99                         REQ-F-06, FM-05
+min_face_px           = 80             # 40-320 - min face size           REQ-F-02, FM-05
+nms_threshold         = 0.30            # 0.1-0.9                          REQ-F-06
+
+[recognition]
+model_path            = ""              # str  - "" = bundled SFace        REQ-F-07, FM-11
+metric                = "cosine"        # cosine|l2                        DES-3.2
+tau                   = 0.0             # 0-1  - 0 = use calibrated tau     REQ-NF-10 (security)
+tau_seed              = 0.363           # SFace published cosine op point   REQ-NF-10
+tau_floor             = 0.363           # tau never calibrated below this   REQ-NF-10/22 (security)
+fmr_target            = 0.01            # <=0.1 - P target FMR              REQ-NF-10, ASM-05 (security)
+fnmr_target           = 0.05            # <=0.5 - P target FNMR             REQ-NF-10
+probe_frames          = 5               # 3-15 - n in k-of-n               REQ-NF-02, FM-03
+match_votes           = 3               # <= probe_frames - k in k-of-n    FM-02/03
+pose_templates        = true            # match best-of enrolled poses (easy off-angle auth)  REQ-F-07
+pose_max              = 5               # 1-15 - max pose sub-templates     REQ-F-07
+
+[presence]
+away_dwell_s          = 30              # 5-600 - auto-lock after absence   REQ-F-10, ASM-02, OQ-1
+poll_s                = 1.0             # 0.2-5                            REQ-F-09
+grace_frames          = 2               # 1-10 - presence hysteresis        REQ-F-09
+
+[stranger]
+policy                = "lenient"       # lenient|strict                   REQ-F-11, ASM-03, OQ-2 (security)
+dwell_s               = 3               # 0-30 - persist before locking     REQ-F-11, NF-04
+
+[liveness]
+mode                  = "off"           # off|blink|turn|passive|full      REQ-F-19 (security)
+challenge_timeout_s   = 4               # 1-15                             REQ-F-19, FM-04
+pad_model_path        = ""              # str  - bundled MiniFASNet (H)     REQ-NF-11
+pad_threshold         = 0.5             # 0-1  - calibrated in H            REQ-NF-11
+turn_yaw_deg          = 15.0            # 5-60 - head-turn challenge angle  REQ-F-19
+
+[lock]
+backend               = "auto"          # auto|gnome_dbus|loginctl|xdg      REQ-F-13, NF-19
+shield                = true            # prototype convenience lock        REQ-F-14
+# PROTOTYPE: a stranger/away raises the face-dismissable shield (+ screen off),
+# NOT the OS password lock, so the returning owner ALWAYS face-unlocks. Only
+# genuine fail-closed events escalate to the password path (SI-P4). Do NOT add
+# "stranger" here in the prototype: the OS lock has no PAM face path, so a face
+# could never clear it and requirement #1 (owner->unlock) would break.
+# Reasons that escalate to the OS PASSWORD lock. "shutdown" is intentionally
+# absent: restarting the service would otherwise throw the GNOME login page that
+# a face cannot clear. Add "shutdown" only for hardening (accepts a password
+# prompt on every stop/restart).
+escalate_os_lock_on   = ["panic", "heartbeat_miss", "suspend"]  # SI-P4
+screen_off            = true            # DPMS: blank monitor while locked   REQ-F-14
+verify_engaged_ms     = 500             # 100-3000 - confirm lock engaged   SI-P5, FM-16
+
+[unlock]
+max_fail_attempts     = 5               # 1-20 - then cooldown              REQ-F-25, ASM-11
+cooldown_s            = 30              # 5-600                            REQ-F-25, FM-15
+owner_name            = "Yash"          # greeting name                     REQ-F-15, ASM-01
+greeting              = true            # show "Welcome back, <name>"       REQ-F-15
+welcome_hold_s        = 0.6             # 0-3 - hold welcome splash on unlock; 0 = instant  REQ-F-15
+
+[privacy]
+persist_frames        = false           # MUST be false in production       REQ-NF-13
+camera_indicator      = true            # tray/LED transparency             REQ-F-27, NF-16
+
+[logging]
+level                 = "INFO"          # DEBUG|INFO|WARNING|ERROR|CRITICAL REQ-F-22
+max_size_mb           = 10              # 1-100 - per-log hard cap          REQ-NF-09, FM-12
+rotate_count          = 5               # 1-20                             REQ-NF-09
+
+[service]
+autostart             = "systemd"       # systemd|xdg                      ASM-10, OQ-6
+heartbeat_sec         = 2               # 1-10 - daemon->guardian beat      FM-08, NF-23
+restart               = "always"        # systemd restart policy            REQ-F-26
+
+[security]
+template_encryption   = "none"          # none|keyring|keyfile (H=keyring)  REQ-NF-14 (security)
+audit                 = false           # HMAC-chained audit (H)            REQ-NF-25
+phase                 = "P"             # P|H (prototype|hardening)         DES-13 (security)
+
+[config]
+on_invalid            = "refuse"        # refuse|default                   REQ-F-23
+
+[runtime]
+threads               = 4               # 1-24 - bounded thread pool        REQ-NF-06/07

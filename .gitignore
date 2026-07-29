@@ -1,0 +1,24 @@
+# Models are provisioned at runtime (SHA-pinned), never committed.
+models/*.onnx
+models/*.sha256
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+
+# Never commit any biometric artefact or captured frame (REQ-NF-13).
+*.tmpl
+*.tmpl.bak
+*.tmpl.sig
+impostor_embeddings.npz
+*.png
+*.jpg
+*.jpeg

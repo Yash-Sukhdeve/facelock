@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "facelock"
+version = "0.1.0"
+description = "Screensaver-only face-unlock prototype (fail-closed, CPU-only, local)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Yash Sukhdeve" }]
+keywords = ["face-unlock", "screensaver", "biometric", "face-recognition", "linux", "opencv"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: X11 Applications",
+    "Intended Audience :: End Users/Desktop",
+    "Topic :: Security",
+]
+
+# Pinned to the verified target platform (REQ-NF-21/26). tomllib is stdlib.
+# numpy 2.x is required by the opencv-python 4.12 pip wheel (see requirements.txt).
+dependencies = [
+    "numpy==2.2.6",
+    "opencv-python==4.12.0.88",
+]
+
+[project.urls]
+Homepage = "https://github.com/Yash-Sukhdeve/facelock"
+Repository = "https://github.com/Yash-Sukhdeve/facelock"
+Issues = "https://github.com/Yash-Sukhdeve/facelock/issues"
+
+[project.optional-dependencies]
+# Hardening PAD can run through cv2.dnn (no extra dep); ORT is optional.
+hardening = ["onnxruntime==1.21.0"]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+facelock = "facelock.cli:main"
+facelockd = "facelock.daemon:main"
+facelock-guardian = "facelock.guardian:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["facelock*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

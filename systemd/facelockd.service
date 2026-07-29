@@ -1,0 +1,26 @@
+[Unit]
+Description=facelock perception daemon (camera -> detect -> verify)
+Documentation=man:facelock
+After=graphical-session.target facelock-guardian.service
+PartOf=graphical-session.target
+# The daemon requests grants from the guardian; start it after the guardian.
+Wants=facelock-guardian.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=%h/.local/bin/facelockd
+# Fail-closed (SI-P2/P4): on crash, systemd restarts the daemon, which comes up
+# LOCKED; while it is down the guardian's watchdog escalates to the OS lock.
+Restart=always
+RestartSec=1
+WatchdogSec=6
+# Bounded CPU/RAM (REQ-NF-06/07/08) + bounded ML thread pool.
+CPUQuota=100%
+MemoryMax=500M
+Environment=OMP_NUM_THREADS=4
+Environment=OPENBLAS_NUM_THREADS=4
+NoNewPrivileges=true
+
+[Install]
+WantedBy=graphical-session.target

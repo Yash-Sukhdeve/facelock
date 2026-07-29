@@ -1,0 +1,5 @@
+# Models are downloaded here at runtime by scripts/download_models.sh
+# (YuNet + SFace from the OpenCV Zoo, SHA-256 pinned). They are intentionally
+# NOT committed (see .gitignore). At runtime the daemon reads models from
+# ~/.local/share/facelock/models by default; download_models.sh populates both
+# this directory (for a repo-local run) and the data dir (for the installed run).
