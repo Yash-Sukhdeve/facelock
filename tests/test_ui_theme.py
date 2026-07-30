@@ -92,6 +92,32 @@ def test_glow_ramp_returns_valid_colours():
     assert all(_HEX.match(c) for c in ramp)
 
 
+def test_corner_bracket_segments_shape_and_bounds():
+    segs = ui.corner_bracket_segments(1920, 1080)
+    assert len(segs) == 8  # two arms per corner, four corners
+    for (x0, y0, x1, y1) in segs:
+        assert 0 <= x0 <= 1920 and 0 <= x1 <= 1920
+        assert 0 <= y0 <= 1080 and 0 <= y1 <= 1080
+
+
+def test_corner_brackets_do_not_invert_on_tiny_display():
+    # Clamped so arms/margins never exceed the display half/third.
+    segs = ui.corner_bracket_segments(60, 40)
+    assert len(segs) == 8
+    for (x0, y0, x1, y1) in segs:
+        assert 0 <= x0 <= 60 and 0 <= x1 <= 60
+        assert 0 <= y0 <= 40 and 0 <= y1 <= 40
+
+
+def test_telemetry_lines_are_stable_strings():
+    for phase in (ui.LOCKED, ui.RECOGNIZING, ui.DENIED, ui.WELCOME, ui.ENROLLING):
+        lines = ui.telemetry_lines(phase, tick=13, owner_name="Yash")
+        assert len(lines) == 4
+        assert all(isinstance(s, str) and s for s in lines)
+    # Deterministic in tick (resume-safe: no wall clock).
+    assert ui.telemetry_lines(ui.LOCKED, 7, "x") == ui.telemetry_lines(ui.LOCKED, 7, "x")
+
+
 def test_phase_captions():
     assert ui.phase_caption(ui.LOCKED) == "LOCKED"
     assert ui.phase_caption(ui.RECOGNIZING) == "CHECKING AUTHORIZATION"

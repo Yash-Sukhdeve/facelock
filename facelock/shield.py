@@ -206,6 +206,23 @@ class ShieldWindow:
 
         try:
             c.delete("all")
+            # Iron-Man HUD frame: L-shaped reticle brackets in the screen corners
+            # + live telemetry readouts, so the whole shield reads as a targeting
+            # overlay rather than a plain lock window. Cosmetic; wrapped so any
+            # renderer hiccup can never crash the guardian loop.
+            for (x0, y0, x1, y1) in ui_theme.corner_bracket_segments(self._w, self._h):
+                c.create_line(x0, y0, x1, y1, fill=th.accent, width=2)
+            readouts = ui_theme.telemetry_lines(phase, tick, self._caption_name)
+            tele_col = ui_theme.hex_lerp(th.accent, ui_theme.BACKGROUND, 0.25)
+            c.create_text(64, 40, text=readouts[0], anchor="w",
+                          fill=tele_col, font=("DejaVu Sans Mono", 11))
+            c.create_text(self._w - 64, 40, text=readouts[1], anchor="e",
+                          fill=tele_col, font=("DejaVu Sans Mono", 11))
+            c.create_text(64, self._h - 38, text=readouts[2], anchor="w",
+                          fill=tele_col, font=("DejaVu Sans Mono", 11))
+            c.create_text(self._w - 64, self._h - 38, text=readouts[3], anchor="e",
+                          fill=tele_col, font=("DejaVu Sans Mono", 11))
+
             # Concentric breathing glow halos (outer -> in).
             halos = ui_theme.glow_ramp(th.ring, tick, th.pulse_period, steps=4)
             for i, colour in enumerate(halos):

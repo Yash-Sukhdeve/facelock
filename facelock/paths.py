@@ -12,6 +12,7 @@ an isolated temp HOME without touching the real user profile.
 from __future__ import annotations
 
 import os
+import secrets
 import stat
 from pathlib import Path
 
@@ -109,24 +110,67 @@ def control_socket_path() -> Path:
 def ensure_dir(path: Path, mode: int = 0o700) -> Path:
     """Create ``path`` (and parents) and enforce ``mode`` (default 0700).
 
-    Idempotent. Parents are created with the same restrictive mode so no
-    biometric-adjacent directory is ever world-readable (REQ-NF-14).
+    Idempotent. EVERY directory this call creates gets ``mode`` -- not just the
+    leaf -- because ``Path.mkdir(parents=True)`` applies the mode only to the
+    final component and leaves intermediates at ``0777 & ~umask`` (typically
+    0755). Tightening each created component keeps no biometric-adjacent
+    directory world-traversable (REQ-NF-14). Pre-existing directories are left
+    at their current mode (we do not loosen or surprise other apps) but are
+    checked: a directory that already exists as a symlink, or is not owned by
+    the current user, is rejected -- this guards the predictable
+    ``/tmp/facelock-<uid>`` runtime fallback against pre-planting by another uid.
     """
-    path.mkdir(mode=mode, parents=True, exist_ok=True)
-    # mkdir mode is subject to umask; enforce explicitly.
-    os.chmod(path, mode)
+    if path.is_symlink():
+        raise OSError(f"refusing to use symlinked directory {path}")
+    if path.exists():
+        _verify_owned_dir(path)
+        os.chmod(path, mode)
+        return path
+    # Create each missing ancestor explicitly so the restrictive mode applies to
+    # all of them, not only the leaf.
+    missing: list[Path] = []
+    cur = path
+    while not cur.exists():
+        missing.append(cur)
+        parent = cur.parent
+        if parent == cur:  # reached filesystem root
+            break
+        cur = parent
+    for d in reversed(missing):
+        try:
+            d.mkdir(mode=mode)
+        except FileExistsError:
+            pass  # raced with a concurrent create; fall through to enforce mode
+        if d.is_symlink():
+            raise OSError(f"refusing to use symlinked directory {d}")
+        _verify_owned_dir(d)
+        os.chmod(d, mode)  # mkdir mode is subject to umask; enforce explicitly
     return path
+
+
+def _verify_owned_dir(path: Path) -> None:
+    """Raise if ``path`` is not a real directory owned by the current user."""
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode):
+        raise OSError(f"expected a directory at {path}")
+    if st.st_uid != os.getuid():
+        raise OSError(f"directory {path} is not owned by the current user")
 
 
 def secure_write_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
     """Atomically write ``data`` to ``path`` with owner-only perms (0600).
 
-    Writes to a temp file in the same directory then renames, so a reader never
-    sees a partially written secret. The file is chmod-ed before the rename.
+    Writes to a fresh, uniquely-named temp file in the same directory then
+    renames, so a reader never sees a partially written secret. The temp file is
+    created with ``O_EXCL | O_NOFOLLOW`` so a pre-planted symlink or temp file
+    can never redirect the 0600 write to an attacker-chosen target (L2/L3).
     """
     ensure_dir(path.parent, 0o700)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    # Unique temp name so O_EXCL never trips on a stale leftover, and a same-uid
+    # actor cannot pre-create a predictable temp path to interfere.
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    fd = os.open(tmp, flags, mode)
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)

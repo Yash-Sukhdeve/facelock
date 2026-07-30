@@ -16,6 +16,13 @@ lock. See the safety notice below.
   fail-closed architecture, YuNet + SFace, per-owner τ + k-of-n voting).
 - Requirements: [`docs/requirements.md`](docs/requirements.md).
 - Biometric spec (matcher, models, operating points): [`docs/BIOMETRICS.md`](docs/BIOMETRICS.md).
+- **Security posture, audit fixes & residual limitations**: [`docs/SECURITY.md`](docs/SECURITY.md).
+
+Every surface — the animated lock **shield**, the guided **enrollment scan**, and
+the **terminal** itself — renders as one neon HUD: cyan-idle / blue-scan /
+red-alert / green-authorized, framed with targeting reticles and live telemetry.
+The terminal HUD auto-disables colour when piped or under `NO_COLOR`, so scripts
+still get clean output (`facelock status --json`).
 
 ---
 
@@ -116,8 +123,9 @@ written** (REQ-NF-13).
 # during install. ALWAYS enroll (step b) BEFORE enabling.
 systemctl --user enable --now facelock-guardian facelockd
 
-# check state / health
+# check state / health (JARVIS-style HUD; add --json for scripts)
 facelock status
+facelock status --json     # machine-readable
 
 # camera + pipeline self-test (fps, per-frame latency, your score vs τ)
 facelock test --seconds 5
@@ -223,7 +231,7 @@ REQ-NF-21/26 pinned deps + reproducible build.
 Hardware-independent unit tests (no camera, no daemon, no display):
 
 ```bash
-python3 -m pytest        # 114 tests
+python3 -m pytest        # 222 tests (matcher, FSM, config, store, HUD, security)
 ```
 
 They cover matcher math, k-of-n voting, τ calibration + floor, config
@@ -231,7 +239,11 @@ validation (incl. security-critical refuse), template store round-trip +
 integrity + secure delete, the FSM (away/stranger/verify/grant/cooldown/
 camera-loss/suspend/disable + fail-closed forcing), the nonce-bound grant
 authority + control socket, liveness geometry + fail-closed hooks, the lock
-controller fallback/verify, and the guardian dispatch.
+controller fallback/verify, and the guardian dispatch. Newer suites cover the
+terminal HUD engine (`test_console.py`) and the hardening fixes from the security
+review (`test_security_hardening.py`: τ-floor override refusal, self-inconsistent
+grant rejection, fail-closed Escape / shield-raise, directory-permission
+tightening, symlink-safe writes, and trusted-path lock resolution).
 
 ## License
 

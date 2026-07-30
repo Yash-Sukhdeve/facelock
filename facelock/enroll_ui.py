@@ -156,6 +156,14 @@ def render(frame_bgr, view: RingView):
         fr = int(ring_r + 18 * view.flash)
         cv2.circle(out, (cx, cy), fr, _WHITE, max(1, int(3 * view.flash)), cv2.LINE_AA)
 
+    # Iron-Man HUD frame: L-shaped reticle brackets in the corners, matching the
+    # lock shield so enrollment and unlock feel like one high-tech system.
+    m, seg = 26, 40
+    for (bx, sx) in ((m, 1), (w - m, -1)):
+        for (by, sy) in ((m, 1), (h - m, -1)):
+            cv2.line(out, (bx, by), (bx + sx * seg, by), _dim(_CYAN, 0.8), 2, cv2.LINE_AA)
+            cv2.line(out, (bx, by), (bx, by + sy * seg), _dim(_CYAN, 0.8), 2, cv2.LINE_AA)
+
     # Face circle + faint glow.
     cv2.circle(out, (cx, cy), spot_r + 4, _dim(_CYAN), 1, cv2.LINE_AA)
     cv2.circle(out, (cx, cy), spot_r, _CYAN, 2, cv2.LINE_AA)

@@ -21,6 +21,25 @@ MemoryMax=500M
 Environment=OMP_NUM_THREADS=4
 Environment=OPENBLAS_NUM_THREADS=4
 NoNewPrivileges=true
+# Sandbox hardening (defense-in-depth). REQ-NF-12: no network surface -- the
+# daemon only talks to the guardian over a Unix socket and reads the camera
+# device, so restrict socket families to AF_UNIX/AF_NETLINK (blocks TCP/UDP).
+# UMask backs up the explicit 0600/0700 file modes; PrivateTmp isolates the
+# per-process /tmp; kernel/namespace protections shrink the blast radius if the
+# ML stack is ever exploited.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+UMask=0077
+Environment=PATH=/usr/bin:/bin:/usr/sbin:/sbin
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=graphical-session.target

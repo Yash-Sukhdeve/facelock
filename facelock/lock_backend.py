@@ -15,7 +15,6 @@ reports "locked" optimistically.
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import time
 from abc import ABC, abstractmethod
@@ -23,8 +22,35 @@ from dataclasses import dataclass
 from typing import Any
 
 
+# Trusted absolute directories the lock/verify binaries may live in. We resolve
+# loginctl/gdbus/xdg-screensaver against THIS fixed list, never the inherited
+# $PATH: a same-uid attacker who prepends ~/.local/bin could otherwise trojan
+# both lock() and is_locked() and forge SI-P5's "verified engaged" confirmation.
+_TRUSTED_BIN_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin",
+                     "/usr/local/bin", "/usr/local/sbin")
+
+
+def resolve_trusted(name: str) -> str | None:
+    """Return the absolute path of ``name`` in a trusted system dir, or None.
+
+    Ignores ``$PATH`` entirely (see ``_TRUSTED_BIN_DIRS``) so the resolved binary
+    cannot be shadowed by a user-writable directory earlier on the path.
+    """
+    for d in _TRUSTED_BIN_DIRS:
+        cand = os.path.join(d, name)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
 def _run(cmd: list[str], timeout: float = 3.0) -> tuple[int, str, str]:
-    """Run a command, returning ``(rc, stdout, stderr)``; never raises."""
+    """Run a command, returning ``(rc, stdout, stderr)``; never raises.
+
+    ``cmd[0]`` must be an absolute path (backends resolve via ``resolve_trusted``);
+    a bare name is rejected so nothing is ever launched through ``$PATH``.
+    """
+    if not cmd or not os.path.isabs(cmd[0]):
+        return 255, "", f"refusing to run non-absolute command: {cmd[:1]}"
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout, check=False,
@@ -58,14 +84,15 @@ class LoginctlBackend(LockBackend):
 
     def __init__(self) -> None:
         self._session = os.environ.get("XDG_SESSION_ID", "")
+        self._bin = resolve_trusted("loginctl")
 
     def available(self) -> bool:
-        return shutil.which("loginctl") is not None
+        return self._bin is not None
 
     def _session_id(self) -> str:
-        if self._session:
+        if self._session or not self._bin:
             return self._session
-        rc, out, _ = _run(["loginctl", "list-sessions", "--no-legend"])
+        rc, out, _ = _run([self._bin, "list-sessions", "--no-legend"])
         if rc == 0:
             for line in out.splitlines():
                 parts = line.split()
@@ -75,16 +102,20 @@ class LoginctlBackend(LockBackend):
         return self._session
 
     def lock(self) -> bool:
+        if not self._bin:
+            return False
         sid = self._session_id()
-        cmd = ["loginctl", "lock-session"] + ([sid] if sid else [])
+        cmd = [self._bin, "lock-session"] + ([sid] if sid else [])
         rc, _, _ = _run(cmd)
         return rc == 0
 
     def is_locked(self) -> bool | None:
+        if not self._bin:
+            return None
         sid = self._session_id()
         if not sid:
             return None
-        rc, out, _ = _run(["loginctl", "show-session", sid, "-p", "LockedHint"])
+        rc, out, _ = _run([self._bin, "show-session", sid, "-p", "LockedHint"])
         if rc != 0:
             return None
         return "LockedHint=yes" in out
@@ -97,19 +128,26 @@ class GnomeDbusBackend(LockBackend):
     _DEST = "org.gnome.ScreenSaver"
     _PATH = "/org/gnome/ScreenSaver"
 
+    def __init__(self) -> None:
+        self._bin = resolve_trusted("gdbus")
+
     def available(self) -> bool:
-        return shutil.which("gdbus") is not None
+        return self._bin is not None
 
     def lock(self) -> bool:
+        if not self._bin:
+            return False
         rc, _, _ = _run([
-            "gdbus", "call", "--session", "--dest", self._DEST,
+            self._bin, "call", "--session", "--dest", self._DEST,
             "--object-path", self._PATH, "--method", f"{self._DEST}.Lock",
         ])
         return rc == 0
 
     def is_locked(self) -> bool | None:
+        if not self._bin:
+            return None
         rc, out, _ = _run([
-            "gdbus", "call", "--session", "--dest", self._DEST,
+            self._bin, "call", "--session", "--dest", self._DEST,
             "--object-path", self._PATH, "--method", f"{self._DEST}.GetActive",
         ])
         if rc != 0:
@@ -122,11 +160,16 @@ class XdgScreensaverBackend(LockBackend):
 
     name = "xdg"
 
+    def __init__(self) -> None:
+        self._bin = resolve_trusted("xdg-screensaver")
+
     def available(self) -> bool:
-        return shutil.which("xdg-screensaver") is not None
+        return self._bin is not None
 
     def lock(self) -> bool:
-        rc, _, _ = _run(["xdg-screensaver", "lock"])
+        if not self._bin:
+            return False
+        rc, _, _ = _run([self._bin, "lock"])
         return rc == 0
 
     def is_locked(self) -> bool | None:

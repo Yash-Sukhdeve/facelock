@@ -168,7 +168,16 @@ class Guardian:
                 continue
             try:
                 if op == "raise":
-                    self.shield.raise_shield(arg or "Locked")
+                    # SI-P4: if the shield cannot obtain an effective input grab
+                    # (grab denied, no display, tkinter missing) raise_shield()
+                    # returns False. The shield is then NOT a barrier, so escalate
+                    # to the real OS lock even for the normally face-dismissable
+                    # reasons (away/stranger/cooldown) rather than leaving the
+                    # desktop interactive behind a cosmetic window.
+                    if not self.shield.raise_shield(arg or "Locked"):
+                        event(self.log, "shield_raise_failed",
+                              detail="no effective input grab; escalating to OS lock")
+                        self._escalate_os_lock("shield_failed")
                 elif op == "status":
                     self.shield.set_status(arg or "Locked")
                 elif op == "checking":
@@ -215,13 +224,23 @@ class Guardian:
             self._enqueue_shield("dismiss")
 
     def _on_password_escape(self) -> None:
-        """Escape key on the shield -> engage the real OS lock (password)."""
+        """Escape key on the shield -> engage the real OS lock (password).
+
+        Fail-closed (SI-P5): the shield is dropped ONLY if the OS lock is
+        confirmed engaged. If no backend confirms (e.g. loginctl/gdbus absent),
+        dismissing would expose the bare desktop -- so we keep our shield up and
+        raise a critical alert instead of trading one lock for none.
+        """
         self.grant.force_locked()
-        self._escalate_os_lock("panic")
-        # The user deliberately wants the password screen: wake the monitor so
-        # they can type, then drop our shield to expose the OS lock.
+        engaged = self._escalate_os_lock("panic")
+        # The user wants the password screen: wake the monitor so they can type.
         self._enqueue_shield("screen_on")
-        self._enqueue_shield("dismiss")
+        if engaged:
+            self._enqueue_shield("dismiss")
+        else:
+            event(self.log, "lock_critical", reason="escape_no_os_lock",
+                  detail="OS lock not confirmed; holding shield instead of exposing desktop")
+            self._enqueue_shield("raise", "Locked - OS password lock unavailable")
 
     # -- lock actuation --------------------------------------------------- #
     def _escalate_os_lock(self, reason: str) -> bool:
@@ -303,10 +322,22 @@ class Guardian:
         epoch = message.get("lock_epoch")
         if not isinstance(nonce, str) or not isinstance(epoch, int):
             return {"ok": False, "reason": "malformed_grant"}
-        ok, why = self.grant.validate_grant(nonce, epoch)
         score = message.get("score")
         tau = message.get("tau")
         live = bool(message.get("live", False))
+        # Defense-in-depth (SI-P1): the guardian independently sanity-checks the
+        # biometric evidence carried by the grant BEFORE consuming the nonce. A
+        # grant whose own score does not clear its own threshold is a daemon bug
+        # or a forged decision -> refuse without dismissing the shield. (The
+        # genuine accept decision is still the daemon's; this only rejects
+        # self-inconsistent grants.)
+        if isinstance(score, (int, float)) and isinstance(tau, (int, float)):
+            if float(score) < float(tau):
+                event(self.log, "unlock_denied", reason="score_below_tau",
+                      score=score, tau=tau, lock_epoch=epoch)
+                self.audit.append("unlock_denied", reason="score_below_tau", epoch=epoch)
+                return {"ok": False, "reason": "score_below_tau"}
+        ok, why = self.grant.validate_grant(nonce, epoch)
         if ok:
             # Wake the monitor first (so the desktop/greeting is visible).
             self._enqueue_shield("screen_on")

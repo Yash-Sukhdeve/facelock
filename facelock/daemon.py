@@ -174,6 +174,14 @@ class PerceptionDaemon:
             tau = template.tau
             if self.cfg.recognition.tau > 0.0:
                 tau = self.cfg.recognition.tau  # explicit override (config)
+            # Safety floor (REQ-NF-22): the threshold is NEVER weaker than the
+            # model's characterized operating point, even via a config override.
+            # Config validation already refuses 0 < tau < tau_floor, but clamp
+            # here too as defense-in-depth so no path can weaken recognition.
+            floor = float(self.cfg.recognition.tau_floor)
+            if tau < floor:
+                event(self.log, "tau_floor_clamped", requested=round(tau, 4), floor=round(floor, 4))
+                tau = floor
             # Multi-pose bank: feed the enrolled per-pose samples so an off-angle
             # face matches the nearest pose (easy auth; REQ-F-07). tau unchanged.
             pose_extras = (template.samples

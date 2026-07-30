@@ -398,6 +398,17 @@ def load_config(source: Path | str | None = None, *, raw: dict[str, Any] | None 
 
     # Cross-field checks.
     rec = values["recognition"]
+    # tau safety floor (REQ-NF-22, security): an explicit recognition.tau
+    # override (non-zero) must never be weaker than tau_floor. A value in
+    # (0, tau_floor) would silently defeat the calibrated operating point and
+    # accept near-arbitrary faces, so it is ALWAYS a hard, fail-closed error
+    # regardless of config.on_invalid. tau == 0 means "use the calibrated tau".
+    if 0.0 < rec["tau"] < rec["tau_floor"]:
+        hard_errors.append(
+            f"recognition.tau ({rec['tau']}) must be 0 (use calibrated tau) or "
+            f">= recognition.tau_floor ({rec['tau_floor']}); a lower override "
+            "would defeat the safety floor (REQ-NF-22)"
+        )
     if rec["match_votes"] > rec["probe_frames"]:
         msg = (
             f"recognition.match_votes ({rec['match_votes']}) must be "

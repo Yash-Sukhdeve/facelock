@@ -20,6 +20,23 @@ CPUQuota=60%
 MemoryMax=500M
 # Least privilege (REQ-NF-27): user service, no root, no new privileges.
 NoNewPrivileges=true
+# Sandbox hardening (defense-in-depth). REQ-NF-12: no network surface -- the
+# control channel is a Unix socket, so restrict to AF_UNIX (+ AF_NETLINK for
+# uevent/session bookkeeping); this blocks any TCP/UDP socket. A tight umask
+# backs up the explicit 0600/0700 chmods against a permissive user umask, and a
+# pinned PATH backs up lock_backend's trusted-absolute-path resolution.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+UMask=0077
+Environment=PATH=/usr/bin:/bin:/usr/sbin:/sbin
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=graphical-session.target

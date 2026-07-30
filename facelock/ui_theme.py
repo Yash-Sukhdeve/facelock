@@ -138,6 +138,51 @@ def glow_ramp(base: str, tick: int, period: int, steps: int = 4) -> list[str]:
     return out
 
 
+def corner_bracket_segments(
+    w: float, h: float, margin: float = 46.0, size: float = 58.0
+) -> list[tuple[float, float, float, float]]:
+    """L-shaped reticle brackets for the four screen corners (Iron-Man HUD).
+
+    Returns a flat list of ``(x0, y0, x1, y1)`` line segments (two per corner)
+    that a renderer draws in the accent colour to frame the whole shield like a
+    targeting overlay. Pure geometry -> unit-testable; clamped so the brackets
+    never invert on a tiny display.
+    """
+    m = _clamp(margin, 4.0, min(w, h) / 2.0)
+    s = _clamp(size, 8.0, min(w, h) / 3.0)
+    segs: list[tuple[float, float, float, float]] = []
+    for cx, sx in ((m, 1.0), (w - m, -1.0)):
+        for cy, sy in ((m, 1.0), (h - m, -1.0)):
+            segs.append((cx, cy, cx + sx * s, cy))          # horizontal arm
+            segs.append((cx, cy, cx, cy + sy * s))          # vertical arm
+    return segs
+
+
+def telemetry_lines(phase: str, tick: int, owner_name: str = "") -> list[str]:
+    """Short, live-looking HUD readouts for the shield corners/margins.
+
+    Deterministic in ``tick`` (no wall clock, so it stays unit-testable and
+    resume-safe) but animated enough to feel alive. Cosmetic only.
+    """
+    name = (owner_name or "operator").strip().upper()
+    scan = 30 + int(70 * triangle(tick, 60))            # 30..100 sweep
+    idx = (tick // 7) % 4
+    spin = ("|", "/", "-", "\\")[tick % 4]
+    status = {
+        LOCKED: "SYS::SECURE",
+        RECOGNIZING: "BIO::SCANNING",
+        DENIED: "SYS::INTRUDER",
+        WELCOME: "AUTH::GRANTED",
+        ENROLLING: "ENROLL::MAPPING",
+    }.get(phase, "SYS::SECURE")
+    return [
+        f"{status} {spin}",
+        f"SCAN {scan:03d}%  ·  CH{idx}",
+        f"OP::{name}",
+        f"FL-{(tick % 9999):04d}",
+    ]
+
+
 def phase_caption(phase: str, owner_name: str = "") -> str:
     """The big status word for a phase (uppercase, futuristic)."""
     name = (owner_name or "").strip().upper()
