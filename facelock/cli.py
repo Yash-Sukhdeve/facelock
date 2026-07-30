@@ -141,6 +141,34 @@ def cmd_enable(args: argparse.Namespace) -> int:
     return code
 
 
+def cmd_pause(args: argparse.Namespace) -> int:
+    """Pause perception (release the camera) for video-conferencing etc.
+
+    With --minutes N the guardian auto-resumes after N minutes; otherwise it
+    stays paused until `facelock resume`. Face-unlock stays fail-closed while
+    paused: the current lock state is held, only the camera is released.
+    """
+    cmd: dict[str, Any] = {"cmd": "pause_perception"}
+    minutes = getattr(args, "minutes", None)
+    if minutes is not None:
+        cmd["minutes"] = minutes
+    _resp, code = _control(cmd)
+    if code == 0:
+        if minutes is not None:
+            print(f"Perception paused; camera released. Auto-resumes in {minutes} min "
+                  f"(or run: facelock resume).")
+        else:
+            print("Perception paused; camera released. Resume with: facelock resume")
+    return code
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    _resp, code = _control({"cmd": "resume_perception"})
+    if code == 0:
+        print("Perception resumed; camera reacquired.")
+    return code
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     resp, code = _control({"cmd": "status"})
     if code == 0:
@@ -283,6 +311,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("lock", help="immediate panic lock").set_defaults(func=cmd_lock)
     sub.add_parser("disable", help="disable face-unlock (password still works)").set_defaults(func=cmd_disable)
     sub.add_parser("enable", help="enable face-unlock").set_defaults(func=cmd_enable)
+    p_pause = sub.add_parser(
+        "pause", help="pause perception / release the camera (e.g. video calls)")
+    p_pause.add_argument(
+        "--minutes", type=float, default=None,
+        help="auto-resume after N minutes (default: stay paused until 'resume')")
+    p_pause.set_defaults(func=cmd_pause)
+    sub.add_parser("resume", help="resume perception after a pause").set_defaults(func=cmd_resume)
     sub.add_parser("status", help="show guardian state/health").set_defaults(func=cmd_status)
     sub.add_parser("disclosure", help="print the prototype spoof-limitation notice").set_defaults(func=cmd_disclosure)
     sub.add_parser("config-check", help="validate the config file").set_defaults(func=cmd_config_check)

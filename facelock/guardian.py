@@ -36,6 +36,7 @@ from .display import DisplayController
 from .lock_backend import LockController, select_backends
 from .logging_setup import AuditLog, event, get_logger
 from .shield import Greeter, ShieldWindow
+from .store import TemplateStore
 
 # Reasons that ALWAYS escalate to the real OS lock, regardless of config: these
 # are security-mandatory (a disabled or unmonitored face-unlock must fall to the
@@ -46,6 +47,13 @@ from .shield import Greeter, ShieldWindow
 # "unlock stopped working after restart" symptom. Stop-time escalation is now
 # governed by config (``escalate_os_lock_on``) and defaults OFF for the prototype.
 _HARD_ESCALATE = frozenset({"panic", "heartbeat_miss", "disable", "error"})
+
+# Lock reasons the USER explicitly requested: they act even with no owner enrolled
+# (engaging the OS password lock, which the user can always clear). EVERY other
+# reason is automatic/system and is gated on an enrolled owner -- with no owner,
+# face-unlock is inert and must never trap the user behind a shield no face can
+# clear (defense-in-depth for the "enabled before enrolled" case).
+_EXPLICIT_LOCK = frozenset({"panic", "disable"})
 
 
 def _sd_notify(state: str) -> None:
@@ -107,6 +115,13 @@ class Guardian:
             enabled=bool(config.lock.screen_off), logger=self.log,
         )
         self.face_unlock_enabled = True
+        # No-owner passive mode: with no enrolled owner, face-unlock is inert and
+        # must NOT take over the screen. Checked at startup and kept in sync from
+        # the daemon's heartbeat health (health["template"]), so enrollment
+        # activates us live without a restart.
+        self._owner_present = self._check_owner_enrolled()
+        # Auto-resume deadline for `facelock pause --minutes N` (None => manual).
+        self._resume_at: float | None = None
 
         self._escalate = set(config.lock.escalate_os_lock_on) | _HARD_ESCALATE
         self._heartbeat_sec = int(config.service.heartbeat_sec)
@@ -145,6 +160,14 @@ class Guardian:
         # it, then resume. The daemon keeps heartbeating, so the watchdog does
         # NOT trip during enrollment.
         self._perception_paused = False
+
+    @staticmethod
+    def _check_owner_enrolled() -> bool:
+        """True if an owner template exists (face-unlock has someone to match)."""
+        try:
+            return TemplateStore().try_load() is not None
+        except Exception:
+            return False
 
     # -- shield queue (executed in main thread) --------------------------- #
     def _enqueue_shield(self, op: str, arg: Any = None) -> None:
@@ -266,6 +289,13 @@ class Guardian:
 
     def _cmd_lock(self, message: dict[str, Any]) -> dict[str, Any]:
         reason = str(message.get("reason", "manual"))
+        # No-owner passive: ignore AUTOMATIC locks when nobody is enrolled -- a
+        # shield with no enrolled face could only be cleared with the OS password,
+        # so an inert face-unlock must not trap the user. Explicit user actions
+        # (panic/disable) still engage the OS password lock.
+        if not self._owner_present and reason not in _EXPLICIT_LOCK:
+            event(self.log, "lock_ignored_no_owner", reason=reason)
+            return {"ok": True, "state": "PASSIVE", "no_owner": True}
         # Re-mint a fresh nonce/epoch and (re-)raise the shield. This is fully
         # idempotent and re-arms on every call, so re-locking after any number of
         # prior unlock cycles works indefinitely (requirement: reliable re-lock).
@@ -359,6 +389,10 @@ class Guardian:
             "os_locked": self.lock_ctl.is_any_locked(),
             "audit_enabled": self.audit.enabled,
             "perception_paused": self._perception_paused,
+            "pause_resume_in_s": (round(self._resume_at - time.monotonic(), 1)
+                                  if (self._perception_paused and self._resume_at is not None)
+                                  else None),
+            "no_owner": not self._owner_present,
         }
 
     def _cmd_reload(self, message: dict[str, Any]) -> dict[str, Any]:
@@ -386,6 +420,13 @@ class Guardian:
         health = message.get("health")
         if isinstance(health, dict):
             self._daemon_health = health
+            # Track owner presence live: enrollment flips template False->True,
+            # which activates us out of no-owner passive mode without a restart.
+            if "template" in health:
+                now_present = bool(health.get("template"))
+                if now_present and not self._owner_present:
+                    event(self.log, "owner_enrolled_activating")
+                self._owner_present = now_present
         if self._watchdog_tripped:
             event(self.log, "heartbeat_recovered", seq=self._heartbeat_seq)
             self._watchdog_tripped = False
@@ -401,12 +442,19 @@ class Guardian:
         The session lock state is left untouched.
         """
         self._perception_paused = True
-        event(self.log, "perception_pause_requested")
-        return {"ok": True, "paused": True, "heartbeat_sec": self._heartbeat_sec}
+        minutes = message.get("minutes")
+        if isinstance(minutes, (int, float)) and minutes > 0:
+            self._resume_at = time.monotonic() + float(minutes) * 60.0
+        else:
+            self._resume_at = None
+        event(self.log, "perception_pause_requested", auto_resume_min=minutes)
+        return {"ok": True, "paused": True, "heartbeat_sec": self._heartbeat_sec,
+                "auto_resume_min": minutes}
 
     def _cmd_resume_perception(self, message: dict[str, Any]) -> dict[str, Any]:
         """Resume perception after enrollment; the daemon reacquires + reloads."""
         self._perception_paused = False
+        self._resume_at = None
         event(self.log, "perception_resume_requested")
         return {"ok": True, "paused": False}
 
@@ -462,6 +510,10 @@ class Guardian:
             self._watchdog_tripped = True
             event(self.log, "heartbeat_miss", age_s=round(age, 2))
             self.audit.append("heartbeat_miss", age_s=round(age, 2))
+            # No owner enrolled -> nothing to protect; stay passive (don't trap the
+            # user behind an OS lock they never asked for).
+            if not self._owner_present:
+                return
             # SI-P4: keep the shield up + escalate to the real OS lock. Wake the
             # monitor so the required password prompt is visible.
             self.grant.force_locked()
@@ -495,10 +547,17 @@ class Guardian:
         if self._install_signals:
             signal.signal(signal.SIGTERM, self._on_signal)
             signal.signal(signal.SIGINT, self._on_signal)
-        # Fail-closed default: start LOCKED with the shield up (SI-P2).
-        self.grant.raise_shield()
-        if self.shield_enabled:
-            self._enqueue_shield("raise", "Locked - facelock starting")
+        # Fail-closed default: start LOCKED with the shield up (SI-P2) -- BUT only
+        # when an owner is enrolled. With no owner, face-unlock is inert; starting
+        # locked would trap the user at a shield no face can clear. Stay passive
+        # until enrollment (the heartbeat then flips us active).
+        if self._owner_present:
+            self.grant.raise_shield()
+            if self.shield_enabled:
+                self._enqueue_shield("raise", "Locked - facelock starting")
+        else:
+            event(self.log, "no_owner_passive",
+                  detail="no enrolled owner; face-unlock inactive -- run 'facelock enroll' to activate")
         self._server = ControlServer(handler=self.dispatch, logger=self.log)
         try:
             self._server.start()
@@ -518,6 +577,12 @@ class Guardian:
                 self._check_watchdog()
                 now = time.monotonic()
                 self._maybe_finish_welcome(now)
+                # `facelock pause --minutes N` auto-resume.
+                if (self._perception_paused and self._resume_at is not None
+                        and now >= self._resume_at):
+                    self._perception_paused = False
+                    self._resume_at = None
+                    event(self.log, "perception_auto_resumed")
                 # Re-assert monitor-off while locked (X wakes the display on its
                 # own timers). This is display-only; perception keeps running in
                 # facelockd, so the owner's return is still detected.

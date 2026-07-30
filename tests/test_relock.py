@@ -103,6 +103,7 @@ def make_guardian(display=None, welcome_hold=0.0):
     # Lock-focused tests want the pre-splash immediate-dismiss behaviour; the
     # welcome-splash timing is exercised separately in test_feedback.py.
     g._welcome_hold_s = welcome_hold
+    g._owner_present = True  # enrolled-owner scenario (see no-owner passive gate)
     return g
 
 

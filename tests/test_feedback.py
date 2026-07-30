@@ -150,6 +150,7 @@ def make_guardian(welcome_hold=0.6):
         install_signals=False,
     )
     g._welcome_hold_s = welcome_hold
+    g._owner_present = True  # enrolled-owner scenario (see no-owner passive gate)
     return g
 
 

@@ -45,12 +45,16 @@ class FakeController:
 
 def make_guardian():
     cfg = load_config(raw={})
-    return Guardian(
+    g = Guardian(
         cfg,
         lock_controller=FakeController(),
         shield=DummyShield(),
         install_signals=False,
     )
+    # These tests exercise the enrolled-owner lock/unlock path; declare an owner
+    # so the no-owner passive gate (added for REQ-F no-owner safety) doesn't apply.
+    g._owner_present = True
+    return g
 
 
 UID = os.getuid()

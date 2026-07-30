@@ -365,8 +365,16 @@ class PerceptionDaemon:
     def _handle_emits(self, emits: list) -> None:
         for sig in emits:
             if sig.kind == "LOCK":
-                resp = self.emitter.request_lock(sig.payload.get("reason", "manual"))
-                event(self.log, "emit_lock", reason=sig.payload.get("reason"),
+                reason = sig.payload.get("reason", "manual")
+                # No enrolled template -> face-unlock is inert. Don't request
+                # automatic (presence/stranger) locks; the guardian ignores them
+                # anyway (no-owner passive), so this just avoids the churn. Explicit
+                # user actions (panic/disable) still pass through.
+                if not self.template_ok and reason not in ("panic", "disable"):
+                    event(self.log, "lock_suppressed_no_template", reason=reason)
+                    continue
+                resp = self.emitter.request_lock(reason)
+                event(self.log, "emit_lock", reason=reason,
                       ok=resp.get("ok"), escalated=resp.get("escalated"))
                 if self.matcher is not None:
                     self.matcher.reset()
