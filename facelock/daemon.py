@@ -271,6 +271,16 @@ class PerceptionDaemon:
             if now >= self._next_recheck:
                 if self.camera.reacquire():
                     self._camera_released = False
+                    # Edge-trigger the exit-from-released on an ACTUAL owner
+                    # return, not on stale absence. This probe reacquire does
+                    # not mean the owner is back (the FSM is still LOCKED_ABSENT
+                    # until _observe sees a face), so restart the settle/absence
+                    # clock: a re-release cannot fire again until a fresh full
+                    # `long_absence_release_s` has elapsed. Without this reset,
+                    # `_absent_since` stayed stale, `long_gone` was permanently
+                    # true, and the device re-released on the very next tick --
+                    # the unbounded camera flap (FM-07 regression).
+                    self._absent_since = now
                     event(self.log, "camera_reacquired")
                 else:
                     self._next_recheck = now + max(3.0, 1.0 / max(self.cfg.camera.fps_idle, 1))
