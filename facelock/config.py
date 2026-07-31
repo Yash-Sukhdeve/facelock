@@ -238,6 +238,12 @@ SCHEMA: tuple[Field, ...] = (
     Field("security", "template_encryption", v_enum("none", "keyring", "keyfile"), "none", "keyring", security=True, req="REQ-NF-14"),
     Field("security", "audit", v_bool, False, True, req="REQ-NF-25"),
     Field("security", "phase", v_phase, "P", _UNSET, security=True, req="DES-13"),
+    # SAFE test mode: log OS-lock escalations but NEVER actuate the OS lock
+    # (no loginctl/gdbus/xdg). security=True -> a bad value refuses to start,
+    # exactly like tau/phase. Default false in BOTH phases (phase-independent).
+    # The recommended surface is the ephemeral --dry-run CLI flag; this config
+    # key is for CI/interactive use and is systemd-hard-gated (resolve_dry_run).
+    Field("security", "dry_run", v_bool, False, _UNSET, security=True, req="DES-DRYRUN"),
     # config meta
     Field("config", "on_invalid", v_enum("refuse", "default"), "refuse", _UNSET, req="REQ-F-23"),
     # runtime
@@ -300,6 +306,50 @@ class Config:
 
     def as_dict(self) -> dict[str, dict[str, Any]]:
         return {name: sec.as_dict() for name, sec in self.sections.items()}
+
+
+# --------------------------------------------------------------------------- #
+# SAFE dry-run resolution + systemd hard-gate (DES-DRYRUN, design section 4.2).
+# --------------------------------------------------------------------------- #
+class DryRunUnderSystemdError(RuntimeError):
+    """Raised when dry-run is requested via config ONLY while under systemd.
+
+    Fail-closed refusal (design section 4.2): a ``security.dry_run=true`` that
+    arrives from config on a systemd-managed service is refused so a shipped
+    unit can never silently disable OS-lock protection. An explicit ``--dry-run``
+    on the command line is always honoured (the deliberate developer escape
+    hatch). The caller (each ``main()``) prints this message and exits non-zero.
+    """
+
+
+def under_systemd() -> bool:
+    """True when running as a ``Type=notify`` systemd service.
+
+    Both ``INVOCATION_ID`` and ``NOTIFY_SOCKET`` are set by the units
+    (``systemd/*.service``); ``NOTIFY_SOCKET`` is already consumed by the
+    processes' ``_sd_notify``. Detection is env-only (no subprocess).
+    """
+    import os
+
+    return ("INVOCATION_ID" in os.environ) or ("NOTIFY_SOCKET" in os.environ)
+
+
+def resolve_dry_run(cli_flag: bool, cfg: "Config") -> bool:
+    """Resolve the effective dry-run flag with the systemd hard-gate.
+
+    Effective value is ``cli_flag OR cfg.security.dry_run``. If dry-run was
+    requested ONLY via config (not the CLI) while under a systemd invocation,
+    this refuses to start by raising :class:`DryRunUnderSystemdError` -- closing
+    the "someone committed ``dry_run=true`` and shipped it" hole. An explicit
+    ``--dry-run`` is always honoured.
+    """
+    want = bool(cli_flag) or bool(cfg.security.dry_run)
+    if want and under_systemd() and not cli_flag:
+        raise DryRunUnderSystemdError(
+            "refusing to start: security.dry_run=true under systemd; dry-run is "
+            "for interactive/CI use only -- pass --dry-run explicitly to override"
+        )
+    return want
 
 
 def _determine_phase(raw: dict[str, Any]) -> str:

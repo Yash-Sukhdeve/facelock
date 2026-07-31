@@ -23,6 +23,7 @@ import hmac
 import json
 import logging
 import os
+import sys
 import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -110,6 +111,36 @@ def event(logger: logging.Logger, kind: str, **fields: Any) -> None:
     try:
         logger.info(record)
     except Exception:  # pragma: no cover - logging must never break locking
+        pass
+
+
+# The exact loud CRITICAL dry-run banner (DES-DRYRUN, design section 4.1.2).
+DRY_RUN_BANNER = (
+    "================= facelock DRY-RUN — NOT PROTECTING THIS SESSION =================\n"
+    "OS-lock actuation is DISABLED. Escalations are logged, never executed.\n"
+    "loginctl/gdbus/xdg will NOT run. Your screen will NOT lock. Do NOT rely on this.\n"
+    "================================================================================"
+)
+
+
+def emit_dry_run_banner(logger: Any, component: str) -> None:
+    """Print the loud dry-run banner to stderr + log a CRITICAL event, every boot.
+
+    A dry-run process must be impossible to start without a visible, logged
+    declaration that the session is NOT protected (design section 4.1.2). Never
+    raises: a logging failure must not stop the process from coming up.
+    """
+    try:
+        print(DRY_RUN_BANNER, file=sys.stderr, flush=True)
+    except Exception:  # pragma: no cover - a broken stderr must not crash startup
+        pass
+    try:
+        logger.critical({
+            "event": "dry_run_active",
+            "component": component,
+            "detail": "OS-lock actuation disabled; this session is NOT protected",
+        })
+    except Exception:  # pragma: no cover
         pass
 
 

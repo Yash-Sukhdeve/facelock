@@ -30,11 +30,16 @@ from pathlib import Path
 from typing import Any
 
 from . import paths as _paths
-from .config import Config, load_config
+from .config import (
+    Config,
+    DryRunUnderSystemdError,
+    load_config,
+    resolve_dry_run,
+)
 from .control import ControlServer, GrantAuthority
 from .display import DisplayController
-from .lock_backend import LockController, select_backends
-from .logging_setup import AuditLog, event, get_logger
+from .lock_backend import DryRunLockController, LockController, select_backends
+from .logging_setup import AuditLog, emit_dry_run_banner, event, get_logger
 from .shield import Greeter, ShieldWindow
 from .store import TemplateStore
 
@@ -86,8 +91,15 @@ class Guardian:
         display: DisplayController | None = None,
         logger: Any = None,
         install_signals: bool = True,
+        dry_run: bool | None = None,
     ) -> None:
         self.cfg = config
+        # SAFE dry-run mode (DES-DRYRUN): effective value is the CLI-resolved
+        # override (from main(), which OR-combines --dry-run with config and
+        # applies the systemd gate) or, when unset, the config key directly so
+        # EVERY construction path is covered. dry-run swaps only the OS-lock
+        # ACTUATOR; all decision logic (shield/nonce/FSM/watchdog) is untouched.
+        self._dry_run = bool(config.security.dry_run if dry_run is None else dry_run)
         self.log = logger or get_logger(
             "facelock.guardian",
             level=config.logging.level,
@@ -100,11 +112,19 @@ class Guardian:
             enabled=bool(config.security.audit),
         )
         self.grant = GrantAuthority(window_s=float(config.liveness.challenge_timeout_s))
-        self.lock_ctl = lock_controller or LockController(
-            select_backends(config.lock.backend),
-            verify_engaged_ms=config.lock.verify_engaged_ms,
-            logger=self.log,
-        )
+        # Single additive seam: an injected controller always wins (tests); else
+        # in dry-run build the no-op DryRunLockController; else -- byte-for-byte
+        # the original REAL controller (dry-run NEVER weakens real mode).
+        if lock_controller is not None:
+            self.lock_ctl = lock_controller
+        elif self._dry_run:
+            self.lock_ctl = DryRunLockController(logger=self.log)
+        else:
+            self.lock_ctl = LockController(
+                select_backends(config.lock.backend),
+                verify_engaged_ms=config.lock.verify_engaged_ms,
+                logger=self.log,
+            )
         self.shield_enabled = bool(config.lock.shield)
         self.shield = shield if shield is not None else ShieldWindow(
             owner_name=config.unlock.owner_name,
@@ -464,6 +484,7 @@ class Guardian:
             "watchdog_tripped": self._watchdog_tripped,
             "os_locked": self.lock_ctl.is_any_locked(),
             "audit_enabled": self.audit.enabled,
+            "dry_run": self._dry_run,
             "perception_paused": self._perception_paused,
             "pause_resume_in_s": (round(self._resume_at - time.monotonic(), 1)
                                   if (self._perception_paused and self._resume_at is not None)
@@ -614,6 +635,7 @@ class Guardian:
             "daemon_state": self._daemon_state,
             "last_heartbeat_age_s": round(time.monotonic() - self._last_heartbeat, 2),
             "watchdog_tripped": self._watchdog_tripped,
+            "dry_run": self._dry_run,
         }
         try:
             _paths.secure_write_bytes(
@@ -645,8 +667,12 @@ class Guardian:
         except OSError as exc:
             event(self.log, "control_server_failed", error=str(exc))
             return 1
+        # Loud CRITICAL declaration BEFORE announcing readiness: a dry-run boot
+        # must never be silent (DES-DRYRUN section 4.1.2).
+        if self._dry_run:
+            emit_dry_run_banner(self.log, "guardian")
         event(self.log, "guardian_started", socket=str(self._server.socket_path),
-              shield=self.shield_enabled, phase=self.cfg.phase)
+              shield=self.shield_enabled, phase=self.cfg.phase, dry_run=self._dry_run)
         _sd_notify("READY=1")
 
         last_health = 0.0
@@ -722,6 +748,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="facelock-guardian",
                                      description="facelock session guardian (lock authority)")
     parser.add_argument("--config", type=Path, default=None, help="path to config.toml")
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="SAFE test mode: log OS-lock escalations but NEVER actuate the OS lock "
+             "(no loginctl/gdbus/xdg -- your screen will not lock)")
     args = parser.parse_args(argv)
     try:
         cfg = load_config(args.config).resolve_model_paths(_paths.models_dir())
@@ -730,7 +760,14 @@ def main(argv: list[str] | None = None) -> int:
         for err in getattr(exc, "errors", []) or []:
             print(f"  - {err}", file=sys.stderr)
         return 2
-    return Guardian(cfg).run()
+    try:
+        dry_run = resolve_dry_run(args.dry_run, cfg)
+    except DryRunUnderSystemdError as exc:
+        # systemd hard-gate: config-only dry-run under a managed service is
+        # fail-closed refused (exit 2, matching the config-refusal contract).
+        print(f"facelock-guardian: {exc}", file=sys.stderr)
+        return 2
+    return Guardian(cfg, dry_run=dry_run).run()
 
 
 if __name__ == "__main__":  # pragma: no cover

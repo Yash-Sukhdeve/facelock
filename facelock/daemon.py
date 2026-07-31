@@ -25,12 +25,17 @@ from pathlib import Path
 from typing import Any
 
 from . import paths as _paths
-from .config import Config, load_config
+from .config import (
+    Config,
+    DryRunUnderSystemdError,
+    load_config,
+    resolve_dry_run,
+)
 from .control import DecisionEmitter
 from .errors import CameraError, ModelError, TemplateError
 from .fsm import FSMConfig, Observation, PresenceStateMachine, State
 from .liveness import LivenessEngine, LivenessObservation
-from .logging_setup import event, get_logger
+from .logging_setup import emit_dry_run_banner, event, get_logger
 from .matcher import Matcher
 from .store import TemplateStore
 
@@ -68,8 +73,15 @@ class PerceptionDaemon:
         logger: Any = None,
         emitter: DecisionEmitter | None = None,
         install_signals: bool = True,
+        dry_run: bool | None = None,
     ) -> None:
         self.cfg = config
+        # SAFE dry-run mode (DES-DRYRUN): surfaced in the banner + heartbeat
+        # health. The daemon holds NO lock authority (SI-P1) -- the guardian is
+        # the sole actuator -- so the safety property is enforced there; the
+        # daemon's flag exists to declare the mode and (future tier-2) to swap
+        # the camera. Effective value = CLI override or the config key.
+        self._dry_run = bool(config.security.dry_run if dry_run is None else dry_run)
         self.log = logger or get_logger(
             "facelock.daemon",
             level=config.logging.level,
@@ -485,6 +497,7 @@ class PerceptionDaemon:
             "fail_count": self.fsm.fail_count,
             "phase": self.cfg.phase,
             "liveness_mode": self.liveness.mode,
+            "dry_run": self._dry_run,
         }
         resp = self.emitter.heartbeat(self._hb_seq, self.fsm.state.value, health)
         _sd_notify("WATCHDOG=1")
@@ -511,9 +524,11 @@ class PerceptionDaemon:
             signal.signal(signal.SIGTERM, self._on_signal)
             signal.signal(signal.SIGINT, self._on_signal)
         self._build_perception()
+        if self._dry_run:
+            emit_dry_run_banner(self.log, "daemon")
         event(self.log, "daemon_started", perception_ok=self.perception_ok,
               template=self.template_ok, phase=self.cfg.phase,
-              liveness=self.liveness.mode)
+              liveness=self.liveness.mode, dry_run=self._dry_run)
         _sd_notify("READY=1")
 
         # Prime the FSM out of INIT (fail-closed LOCKED); the guardian is the
@@ -576,6 +591,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="facelockd",
                                      description="facelock perception daemon")
     parser.add_argument("--config", type=Path, default=None, help="path to config.toml")
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="SAFE test mode: declare no-OS-lock dry-run (the guardian is the "
+             "actuator; this surfaces the mode in the banner + health)")
     args = parser.parse_args(argv)
     try:
         cfg = load_config(args.config).resolve_model_paths(_paths.models_dir())
@@ -584,7 +603,13 @@ def main(argv: list[str] | None = None) -> int:
         for err in getattr(exc, "errors", []) or []:
             print(f"  - {err}", file=sys.stderr)
         return 2
-    return PerceptionDaemon(cfg).run()
+    try:
+        dry_run = resolve_dry_run(args.dry_run, cfg)
+    except DryRunUnderSystemdError as exc:
+        # systemd hard-gate (fail-closed refuse; exit 2).
+        print(f"facelockd: {exc}", file=sys.stderr)
+        return 2
+    return PerceptionDaemon(cfg, dry_run=dry_run).run()
 
 
 if __name__ == "__main__":  # pragma: no cover
