@@ -141,9 +141,22 @@ class Guardian:
         # activity/DPMS timers, so while the shield is up we re-issue "force off"
         # on this cadence. This never touches the camera/perception (that runs in
         # facelockd), so the owner's return is still detected and wakes the screen.
+        # The cadence is deliberately SLOW: a 3s cadence spawned 42,336 `xset`
+        # off events in one locked-away session (FM-DPMS). 30s keeps the OFF
+        # intent (fights X's wake timers) at ~1/10th the subprocess volume.
         self._screen_off_active = False
-        self._screen_reassert_s = 3.0
+        self._screen_reassert_s = 30.0
         self._last_screen_assert = 0.0
+        # Last DPMS state we actually issued (None = unknown at boot). Guards
+        # against re-spawning `xset` for a state the monitor is already in
+        # (de-dupe of redundant same-state screen_on/screen_off calls).
+        self._last_dpms_on: bool | None = None
+        # Debounced perception DPMS desire, set by shield_status and reconciled
+        # ONCE per shield-queue drain (one main-loop tick). This collapses a rapid
+        # recognizing<->locked flap into at most one real transition per tick.
+        # None = no pending desire. DPMS is cosmetic monitor power ONLY; this
+        # never gates lock/shield authority (fail-closed posture is untouched).
+        self._dpms_desired: bool | None = None
 
         self._shield_q: "queue.Queue[tuple[str, Any]]" = queue.Queue()
         self._server: ControlServer | None = None
@@ -171,6 +184,12 @@ class Guardian:
 
     # -- shield queue (executed in main thread) --------------------------- #
     def _enqueue_shield(self, op: str, arg: Any = None) -> None:
+        # An authoritative DPMS decision (lock/unlock/escalation enqueues
+        # screen_on/screen_off) supersedes any pending debounced perception
+        # desire, so a stale shield_status frame cannot re-toggle the monitor
+        # behind an explicit lock/unlock/password action.
+        if op in ("screen_on", "screen_off"):
+            self._dpms_desired = None
         self._shield_q.put((op, arg))
 
     def _drain_shield_queue(self) -> None:
@@ -205,10 +224,35 @@ class Guardian:
                     self.shield.dismiss()
             except Exception as exc:  # shield errors never crash the guardian
                 event(self.log, "shield_error", op=op, error=str(exc))
+        # Reconcile the debounced perception DPMS desire ONCE per drain (one main
+        # -loop tick). Collapsing here means a rapid recognizing<->locked flap
+        # queued within a tick applies at most one real transition, and the
+        # last-state de-dupe in _do_screen_* suppresses redundant same-state
+        # calls. Cosmetic monitor power only -- never touches shield/grant state.
+        self._reconcile_perception_dpms()
 
     # -- monitor power (DPMS), executed in the main thread ---------------- #
+    def _reconcile_perception_dpms(self) -> None:
+        """Apply the latest debounced perception DPMS desire (main thread)."""
+        want = self._dpms_desired
+        if want is None:
+            return
+        self._dpms_desired = None
+        if want:
+            self._do_screen_on()
+        else:
+            self._do_screen_off()
+
     def _do_screen_off(self) -> None:
-        """Blank the monitor and arm the re-assert cadence (main thread)."""
+        """Blank the monitor and arm the slow re-assert cadence (main thread).
+
+        De-duped: if the monitor is already known-blanked we keep the OFF
+        *intent* (the slow re-assert still fights X's wake timers) but do NOT
+        re-spawn `xset`, so a stream of 'locked' frames cannot strobe the display.
+        """
+        if self._last_dpms_on is False:
+            self._screen_off_active = True   # keep intent; no redundant xset
+            return
         try:
             issued = self.display.screen_off()
         except Exception as exc:  # never let display errors crash the guardian
@@ -217,15 +261,47 @@ class Guardian:
         # Only arm the cadence if the command was actually issued; otherwise a
         # disabled/absent display would spin the re-assert loop for nothing.
         self._screen_off_active = bool(issued)
-        self._last_screen_assert = time.monotonic()
+        if issued:
+            self._last_dpms_on = False
+            self._last_screen_assert = time.monotonic()
 
     def _do_screen_on(self) -> None:
-        """Wake the monitor and stop re-asserting (main thread)."""
+        """Wake the monitor and stop re-asserting (main thread).
+
+        De-duped: a repeat 'recognizing' frame while already awake is a no-op
+        (no redundant `xset`), but the re-assert is always disarmed so we never
+        blank behind a present owner.
+        """
         self._screen_off_active = False
+        if self._last_dpms_on is True:
+            return
         try:
             self.display.screen_on()
+            self._last_dpms_on = True
         except Exception as exc:
             event(self.log, "display_error", op="on", error=str(exc))
+
+    def _maybe_reassert_screen(self, now: float) -> bool:
+        """Re-issue DPMS-off on a SLOW cadence while locked-away (main thread).
+
+        Returns True iff it spawned an `xset`. Runs only while the screen is
+        intentionally blanked (``_screen_off_active``) and at most once every
+        ``_screen_reassert_s`` (>=30s). This deliberately re-issues OFF even
+        though we believe the monitor is already off -- its whole job is to fight
+        X waking the display on its own DPMS/activity timers -- so it bypasses the
+        same-state de-dupe. It never blanks a present owner (guarded by
+        ``_screen_off_active``, which ``_do_screen_on`` clears).
+        """
+        if not self._screen_off_active:
+            return False
+        if (now - self._last_screen_assert) < self._screen_reassert_s:
+            return False
+        try:
+            self.display.screen_off()
+        except Exception as exc:
+            event(self.log, "display_error", op="reassert", error=str(exc))
+        self._last_screen_assert = now
+        return True
 
     def _maybe_finish_welcome(self, now: float) -> None:
         """Dismiss the shield once the post-unlock welcome hold elapses.
@@ -480,22 +556,27 @@ class Guardian:
         # actually visible (while locked-and-away the screen is DPMS-off). When
         # they leave, blank it again. This is what makes the graphics show.
         now = time.monotonic()
+        # DPMS side note: instead of enqueuing a screen_on/screen_off per frame
+        # (which strobed the monitor under a camera flap), record the DESIRED
+        # DPMS state; _drain_shield_queue reconciles it once per tick with the
+        # last-state de-dupe. This debounces the perception-driven monitor power
+        # while leaving the visual feedback (checking/denied/status) per-frame.
         if phase == "recognizing":  # CHECKING AUTHORIZATION (with a real progress bar)
             if now < self._denied_until:
                 return {"ok": True, "held": "denied"}  # let the verdict linger
             progress = float(message.get("progress") or 0.0)
             votes_k = int(message.get("votes_k") or 0)
             votes_need = int(message.get("votes_need") or 0)
-            self._enqueue_shield("screen_on")
+            self._dpms_desired = True  # someone is present -> wake (debounced)
             self._enqueue_shield("checking", (progress, votes_k, votes_need))
         elif phase == "denied":  # UNAUTHORIZED verdict
             self._denied_until = now + self._denied_hold_s
-            self._enqueue_shield("screen_on")
+            self._dpms_desired = True  # show the verdict -> wake (debounced)
             self._enqueue_shield("denied", "Unauthorized user")
         elif phase == "locked":
             reason = str(message.get("reason") or "away")
             self._enqueue_shield("status", _status_for(reason))
-            self._enqueue_shield("screen_off")  # nobody present -> dark again
+            self._dpms_desired = False  # nobody present -> dark again (debounced)
         else:
             return {"ok": False, "reason": "bad_phase", "phase": phase}
         return {"ok": True}
@@ -585,14 +666,9 @@ class Guardian:
                     event(self.log, "perception_auto_resumed")
                 # Re-assert monitor-off while locked (X wakes the display on its
                 # own timers). This is display-only; perception keeps running in
-                # facelockd, so the owner's return is still detected.
-                if (self._screen_off_active
-                        and (now - self._last_screen_assert) >= self._screen_reassert_s):
-                    try:
-                        self.display.screen_off()
-                    except Exception as exc:
-                        event(self.log, "display_error", op="reassert", error=str(exc))
-                    self._last_screen_assert = now
+                # facelockd, so the owner's return is still detected. Runs on a
+                # SLOW cadence (see _maybe_reassert_screen) to avoid the xset storm.
+                self._maybe_reassert_screen(now)
                 if now - last_health >= 2.0:
                     self._write_health()
                     _sd_notify("WATCHDOG=1")
