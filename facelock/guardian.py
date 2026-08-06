@@ -230,7 +230,13 @@ class Guardian:
                 continue
             try:
                 if op == "raise":
-                    self.shield.raise_shield(arg or "Locked")
+                    # SI-P5 / REQ-F-14: the shield is only a barrier if its input
+                    # grab actually holds. raise_shield returns the VERIFIED grab
+                    # result; an unconfirmed grab (window up but capturing no
+                    # keyboard/pointer) offers no protection, so we fail-closed and
+                    # escalate to the real OS lock rather than trusting it.
+                    if not self.shield.raise_shield(arg or "Locked"):
+                        self._on_shield_grab_unconfirmed()
                 elif op == "status":
                     self.shield.set_status(arg or "Locked")
                 elif op == "checking":
@@ -341,6 +347,31 @@ class Guardian:
         # they can type, then drop our shield to expose the OS lock.
         self._enqueue_shield("screen_on")
         self._enqueue_shield("dismiss")
+
+    def _on_shield_grab_unconfirmed(self) -> None:
+        """Fail-closed when the shield mapped but its input grab is NOT confirmed.
+
+        SI-P5 / REQ-F-14: a shield that captures no keyboard/pointer is just a
+        picture -- a stranger could interact with the desktop behind it. Such an
+        ungrabbed shield must NEVER be treated as a successful lock. So we do the
+        same verify-and-escalate the OS-lock path uses: engage the REAL OS lock
+        (strictly safer, even though it needs a password) and wake the monitor so
+        the required password prompt is visible.
+
+        Trade-off (intentional): a normally face-dismissible away/stranger lock
+        becomes password-required in this degraded case. Losing face-convenience
+        is acceptable when the alternative is an unprotected session; this fires
+        ONLY when the grab cannot be confirmed, so normal (grabbed) operation --
+        every existing shield test -- is unchanged.
+        """
+        event(self.log, "shield_grab_unconfirmed",
+              detail="shield input grab not confirmed; escalating to OS lock (fail-closed)")
+        self.audit.append("shield_grab_unconfirmed")
+        # Invalidate any grant minted for this ungrabbed shield and engage the
+        # real OS lock; keep the monitor lit for the password prompt.
+        self.grant.force_locked()
+        self._escalate_os_lock("shield_grab_failed")
+        self._enqueue_shield("screen_on")
 
     # -- lock actuation --------------------------------------------------- #
     def _escalate_os_lock(self, reason: str) -> bool:

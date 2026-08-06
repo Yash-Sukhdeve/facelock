@@ -83,7 +83,8 @@ class ShieldWindow:
         return "." * ((tick // 3) % 4)
 
     def raise_shield(self, status: str = "Locked") -> bool:
-        """Show the shield, grabbing input. Returns True on success.
+        """Show the shield, grabbing input. Returns True ONLY if the input grab
+        is CONFIRMED held (the shield is actually capturing keyboard + pointer).
 
         The Tk root is created ONCE and then reused across lock/unlock cycles
         (dismiss hides it; raise re-shows it). Creating a fresh ``tk.Tk()`` on
@@ -93,12 +94,20 @@ class ShieldWindow:
         root cause of "locked the 1st time but not the 2nd". Reusing one root
         makes re-locking reliable indefinitely.
 
-        On any failure (no display, tkinter missing, grab denied) returns False
-        so the guardian can fall back to the OS-lock backend (fail-closed).
+        SI-P5 / REQ-F-14: the return value is now the VERIFIED grab result, not
+        merely "the window mapped". On any failure that leaves the shield unable
+        to capture input -- no display, tkinter missing, the window failing to
+        map, OR the input grab being denied/unconfirmed (both ``grab_set_global``
+        and the ``grab_set`` fallback failing, checked via Tk ``grab_status``) --
+        this returns False. A False return means the shield offers NO input
+        protection, so the guardian must fall back to the real OS lock
+        (fail-closed): an ungrabbed shield must never be treated as a real lock.
         """
         if self._up:
             self.set_status(status)
-            return True
+            # Already shown: re-verify the grab is still actually held so a lost
+            # grab on a re-raise still reports False (fail-closed).
+            return self._grab_confirmed()
         if not has_display():
             return False
         try:
@@ -116,10 +125,12 @@ class ShieldWindow:
                 self._root.attributes("-topmost", True)
             self._root.update_idletasks()
             self._root.update()
-            self._grab()                # grab input AFTER the window is mapped
+            grabbed = self._grab()      # grab input AFTER the window is mapped
             self._root.focus_force()
+            # The window IS mapped, so keep it up for later dismiss/cleanup even
+            # when the grab failed; the caller escalates on the False result.
             self._up = True
-            return True
+            return grabbed
         except Exception:
             self._safe_destroy()
             return False
@@ -287,10 +298,18 @@ class ShieldWindow:
             # A rendering hiccup must never crash the guardian loop.
             pass
 
-    def _grab(self) -> None:
-        """Grab pointer + keyboard globally, falling back to a local grab."""
+    def _grab(self) -> bool:
+        """Grab pointer + keyboard globally, falling back to a local grab.
+
+        Returns True ONLY if the grab is CONFIRMED held afterwards (queried via
+        Tk ``grab_status``). Both ``grab_set_global()`` failing AND the weaker
+        ``grab_set()`` fallback failing -- or either "succeeding" without Tk
+        actually reporting a grab -- yield False. A False result means the shield
+        is NOT capturing input (SI-P5 / REQ-F-14): it offers no protection and the
+        guardian must fall back to the real OS lock.
+        """
         if self._root is None:
-            return
+            return False
         try:
             self._root.grab_set_global()
         except Exception:
@@ -298,7 +317,23 @@ class ShieldWindow:
             try:
                 self._root.grab_set()
             except Exception:
-                pass
+                return False
+        # Never assume: confirm Tk reports this root actually holds the grab.
+        return self._grab_confirmed()
+
+    def _grab_confirmed(self) -> bool:
+        """True iff Tk confirms THIS root currently holds the input grab.
+
+        ``grab_status()`` returns ``None`` when the widget holds no grab, or
+        ``"local"``/``"global"`` when it does -- so a silently-denied grab (the
+        audit gap) is caught here rather than trusted.
+        """
+        if self._root is None:
+            return False
+        try:
+            return self._root.grab_status() in ("local", "global")
+        except Exception:
+            return False
 
     def _on_escape(self, _event: object = None) -> str:
         if self.on_password_escape is not None:
