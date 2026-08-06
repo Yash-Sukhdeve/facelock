@@ -165,6 +165,86 @@ def test_heartbeat_miss_still_escalates_and_keeps_screen_on():
     assert g.display.off_calls == 0
 
 
+# --- D. Task-4 regression pins: escalation-leak fixed, per-reason ----------- #
+# Pins the fix for a bug where an "away" event escalated all the way to the OS
+# password lock -- a screen a face can never clear (the daemon has no PAM path).
+# Every face-dismissable reason MUST take the shield-only/screen_off branch and
+# NEVER call the OS backend; every fail-closed reason MUST still escalate. These
+# assertions are per-reason (not just "some reason somewhere") so a future edit
+# that drops one reason from `_HARD_ESCALATE` / `escalate_os_lock_on` (or adds a
+# face-dismissable reason to it by mistake) fails immediately, not silently.
+def test_manual_lock_uses_shield_not_os_backend():
+    # A bare `{"cmd": "lock"}` (no reason) and an explicit "manual" reason both
+    # default to the manual/face-dismissable branch -- must not touch the OS lock.
+    g = make_guardian()
+    resp = g.dispatch({"cmd": "lock", "reason": "manual"}, UID)
+    assert resp["ok"] and resp["state"] == "LOCKED"
+    assert resp["escalated"] is False
+    assert g.lock_ctl.engage_calls == 0   # OS password path NOT touched
+    g._drain_shield_queue()
+    assert g.shield.is_up is True
+    assert g.display.off_calls == 1 and g.display.on_calls == 0
+
+
+def test_cooldown_lock_uses_shield_not_os_backend():
+    # Too-many-failed-attempts cooldown is a prototype/UX guard, not a fail-closed
+    # security event -- it must stay on the face-dismissable shield path.
+    g = make_guardian()
+    resp = g.dispatch({"cmd": "lock", "reason": "cooldown"}, UID)
+    assert resp["escalated"] is False
+    assert g.lock_ctl.engage_calls == 0
+    g._drain_shield_queue()
+    assert g.shield.is_up is True
+    assert g.display.off_calls == 1 and g.display.on_calls == 0
+
+
+def test_panic_lock_escalates_and_keeps_screen_on():
+    # Explicit user panic MUST engage the real OS lock (SI-P4) with the monitor
+    # kept on so the password prompt is visible.
+    g = make_guardian()
+    resp = g.dispatch({"cmd": "lock", "reason": "panic"}, UID)
+    assert resp["escalated"] is True
+    assert g.lock_ctl.engage_calls == 1
+    g._drain_shield_queue()
+    assert g.display.on_calls >= 1 and g.display.off_calls == 0
+
+
+def test_suspend_lock_escalates_and_keeps_screen_on():
+    # Resume-from-suspend is a hard fail-closed event (default escalate_os_lock_on
+    # includes "suspend") -- must engage the real OS lock, not just the shield.
+    g = make_guardian()
+    resp = g.dispatch({"cmd": "lock", "reason": "suspend"}, UID)
+    assert resp["escalated"] is True
+    assert g.lock_ctl.engage_calls == 1
+    g._drain_shield_queue()
+    assert g.display.on_calls >= 1 and g.display.off_calls == 0
+
+
+def test_disable_reason_lock_escalates_and_keeps_screen_on():
+    # A LOCK event carrying reason="disable" (the FSM's disable-state entry,
+    # `facelock/fsm.py::_enter_locked("disable", ...)`, routed through the
+    # daemon's `request_lock`) reaches `_cmd_lock` -- NOT the separate `cmd:
+    # "disable"` handler. It must still hit `_HARD_ESCALATE` and engage the real
+    # OS lock, same as the dedicated disable command does.
+    g = make_guardian()
+    resp = g.dispatch({"cmd": "lock", "reason": "disable"}, UID)
+    assert resp["escalated"] is True
+    assert g.lock_ctl.engage_calls == 1
+    g._drain_shield_queue()
+    assert g.display.on_calls >= 1 and g.display.off_calls == 0
+
+
+def test_error_lock_escalates_and_keeps_screen_on():
+    # `facelock/fsm.py` emits `lock("error")` on an unexpected/inconsistent
+    # observation -- a hard fail-closed reason, must engage the real OS lock.
+    g = make_guardian()
+    resp = g.dispatch({"cmd": "lock", "reason": "error"}, UID)
+    assert resp["escalated"] is True
+    assert g.lock_ctl.engage_calls == 1
+    g._drain_shield_queue()
+    assert g.display.on_calls >= 1 and g.display.off_calls == 0
+
+
 # --- A. monitor off on lock, on on unlock ---------------------------------- #
 def test_unlock_turns_monitor_back_on():
     g = make_guardian()
