@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 
 from facelock.liveness import (
+    PAD_CLASSES,
     PAD_INPUT_SIZE,
     PAD_LIVE_INDEX,
     PAD_SCALES,
@@ -244,6 +245,76 @@ def test_fuse_fail_closed_on_empty():
 def test_live_prob_fail_closed_on_malformed_single_class():
     """A malformed 1-class output cannot address the live index -> None."""
     assert pad_live_prob([0.7]) is None
+
+
+# ------------------- I1: enforce the 3-class decode contract --------------- #
+def test_pad_classes_is_three():
+    """The Silent-Face head is exactly 3 classes (attack, live, attack)."""
+    assert PAD_CLASSES == 3
+
+
+def test_live_prob_rejects_two_class_output():
+    """I1 (SECURITY): the OLD guard was ``probs.size <= PAD_LIVE_INDEX`` (<=1),
+    so a 2-class ``[0.1, 5.0]`` sailed through with a spurious ~0.9926 'live'.
+    The decoder MUST reject anything but exactly PAD_CLASSES classes and DENY."""
+    probs = pad_softmax([0.1, 5.0])
+    assert probs.size == 2                     # it really is a 2-class vector
+    assert float(probs[PAD_LIVE_INDEX]) > 0.99  # what the old guard admitted
+    assert pad_live_prob([0.1, 5.0]) is None    # new contract -> fail-closed
+
+
+def test_live_prob_rejects_four_class_output():
+    """I1 (SECURITY): a 4-class head put ~0.99963 at index 1 -- also a spurious
+    'live'. Reject any output whose class count is not exactly PAD_CLASSES."""
+    probs = pad_softmax([0.0, 9.0, 0.0, 0.0])
+    assert probs.size == 4
+    assert float(probs[PAD_LIVE_INDEX]) > 0.99
+    assert pad_live_prob([0.0, 9.0, 0.0, 0.0]) is None
+
+
+def test_live_prob_accepts_exactly_three_classes():
+    """I1: a valid 3-class output still decodes (the contract does not
+    over-reject and break the golden bona-fide path)."""
+    p = pad_live_prob([0.0, 3.0, 0.0])
+    assert p is not None and abs(p - 0.909442998512742) < 1e-9
+
+
+def test_fuse_fail_closed_when_a_scale_is_wrong_class_count():
+    """I1 propagates through fusion: a non-3-class scale poisons the fused
+    verdict to None (deny), even if the other scale is a clean bona-fide."""
+    assert pad_fuse_live_prob(([0.0, 3.0, 0.0], [0.1, 5.0])) is None   # 3 + 2
+    assert pad_fuse_live_prob(([0.0, 9.0, 0.0, 0.0], [0.0, 1.0, 0.0])) is None  # 4 + 3
+
+
+# ---------------- M1: score_crops must require BOTH scales ----------------- #
+def test_score_crops_requires_both_scales():
+    """M1 (SECURITY): fusing a SINGLE provisioned scale is uncalibrated (the
+    two-scale mean is the pinned Silent-Face operating point). One scale -> DENY;
+    both scales -> the fused mean of the per-scale live probabilities."""
+    pad = _PassivePAD("/nonexistent-model.onnx", 0.5)
+    # Force the availability + net gates open so we reach the scale-set check,
+    # and stub inference so nothing loads a model.
+    pad.available = True
+    pad._net = object()
+    pad.score = lambda crop: 0.9  # constant single-scale live prob
+    crop = np.full((80, 80, 3), 128, np.uint8)
+    # Only one of the two required scales present -> uncalibrated -> DENY.
+    assert pad.score_crops({PAD_SCALES[0]: crop}) is None
+    assert pad.score_crops({PAD_SCALES[1]: crop}) is None
+    # Both required scales present -> fuses to the mean.
+    fused = pad.score_crops({PAD_SCALES[0]: crop, PAD_SCALES[1]: crop})
+    assert fused is not None and abs(fused - 0.9) < 1e-9
+
+
+def test_score_crops_wrong_single_scale_key_denies():
+    """M1: a lone crop under a non-canonical scale key is still single-scale and
+    still denies (the set of provisioned scales must cover BOTH PAD_SCALES)."""
+    pad = _PassivePAD("/nonexistent-model.onnx", 0.5)
+    pad.available = True
+    pad._net = object()
+    pad.score = lambda crop: 0.9
+    crop = np.full((80, 80, 3), 128, np.uint8)
+    assert pad.score_crops({1.5: crop}) is None
 
 
 def test_live_prob_fail_closed_on_empty():

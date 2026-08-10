@@ -104,6 +104,7 @@ class PerceptionDaemon:
             turn_yaw_deg=config.liveness.turn_yaw_deg,
             pad_model_path=config.liveness.pad_model_path,
             pad_threshold=config.liveness.pad_threshold,
+            pad_min_live_frames=config.liveness.pad_min_live_frames,
         )
         self.fsm = PresenceStateMachine(FSMConfig(
             away_dwell_s=config.presence.away_dwell_s,

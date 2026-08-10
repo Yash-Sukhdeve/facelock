@@ -203,6 +203,10 @@ SCHEMA: tuple[Field, ...] = (
     Field("liveness", "challenge_timeout_s", v_int(1, 15), 4, _UNSET, req="REQ-F-19,FM-04"),
     Field("liveness", "pad_model_path", v_str, "", _UNSET, req="REQ-NF-11"),
     Field("liveness", "pad_threshold", v_float(0.0, 1.0), 0.5, _UNSET, req="REQ-NF-11"),
+    # Passive-PAD temporal quorum (k): frames in a burst that must INDEPENDENTLY
+    # clear pad_threshold before a live verdict (k-of-n, mirrors match_votes).
+    # Replaces max-across-frames aggregation (I2, fail-closed on the time axis).
+    Field("liveness", "pad_min_live_frames", v_int(1, 15), 3, _UNSET, req="REQ-NF-11,FM-03"),
     Field("liveness", "turn_yaw_deg", v_float(5.0, 60.0), 15.0, _UNSET, req="REQ-F-19"),
     # lock
     Field("lock", "backend", v_enum("auto", "gnome_dbus", "loginctl", "xdg"), "auto", _UNSET, req="REQ-F-13,NF-19"),

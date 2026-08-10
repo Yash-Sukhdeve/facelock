@@ -263,9 +263,13 @@ def pad_softmax(logits: "np.ndarray | list | tuple") -> np.ndarray:
 def pad_live_prob(logits: "np.ndarray | list | tuple | None") -> float | None:
     """Single-scale bona-fide (live) probability = ``softmax(logits)[1]``.
 
-    Returns ``None`` (fail-closed) for a missing, empty, malformed (fewer than
-    two classes), or non-finite output -- anything that cannot be trusted to
-    address the live class is treated as spoof by the caller.
+    Enforces the Silent-Face **3-class** decode contract (I1, fail-closed):
+    the head is exactly ``PAD_CLASSES`` == 3 outputs ``[attack, live, attack]``,
+    so ANY output with a different class count is rejected with ``None`` --
+    never decoded. The previous guard only rejected ``<= PAD_LIVE_INDEX`` (i.e.
+    0- or 1-class) outputs, which let a wrong-head 2-class ``[0.1, 5.0]`` or
+    4-class ``[0, 9, 0, 0]`` place a spurious ~0.99 at index 1 and read as
+    'live' (a fail-OPEN). A missing/empty/non-finite output is likewise ``None``.
     """
     if logits is None:
         return None
@@ -273,7 +277,9 @@ def pad_live_prob(logits: "np.ndarray | list | tuple | None") -> float | None:
         probs = pad_softmax(logits)
     except (ValueError, TypeError):
         return None
-    if probs.size <= PAD_LIVE_INDEX:
+    # Exact 3-class contract: anything else cannot be trusted to address the
+    # live class -> treat as spoof (deny). PAD_CLASSES pins the Silent-Face head.
+    if probs.size != PAD_CLASSES:
         return None
     return float(probs[PAD_LIVE_INDEX])
 
@@ -371,16 +377,24 @@ class _PassivePAD:
     def score_crops(self, pad_crops: "dict[float, np.ndarray] | None") -> float | None:
         """Return the two-scale FUSED live probability, or ``None`` (deny).
 
-        Runs the net over each provisioned scale crop and fuses via
-        :func:`pad_fuse_live_prob` (mean of the per-scale live probs). If any
-        scale is missing/degraded, or there are no crops, returns ``None`` so
-        the verify path fails closed. (Two distinct per-scale nets are wired in
-        task T5; this single-net path already applies the correct fusion math.)
+        Runs the net over BOTH calibrated scale crops and fuses as the mean of
+        the per-scale live probs (Silent-Face ``(pred_2.7 + pred_4.0)[1] / 2``).
+        BOTH :data:`PAD_SCALES` crops are REQUIRED (M1, fail-closed): a
+        single-scale fusion is uncalibrated -- the pinned operating point is the
+        two-scale mean, so a lone scale must never grant. If either required
+        scale is absent/degraded, or there are no crops, returns ``None`` so the
+        verify path fails closed. (Two distinct per-scale nets are wired in task
+        T5; this single-net path already applies the correct fusion math.)
         """
         if not self.available or self._net is None or not pad_crops:
             return None
-        per_scale = [self.score(pad_crops[scale]) for scale in sorted(pad_crops)]
-        if not per_scale or any(p is None for p in per_scale):
+        # Require BOTH calibrated scales before any live verdict (M1).
+        if not set(pad_crops) >= set(PAD_SCALES):
+            return None
+        # Fuse over exactly the two calibrated scales (ignore any stray key),
+        # in a fixed order so the mean is deterministic.
+        per_scale = [self.score(pad_crops[scale]) for scale in sorted(PAD_SCALES)]
+        if any(p is None for p in per_scale):
             return None
         return float(sum(per_scale) / len(per_scale))
 
@@ -397,11 +411,17 @@ class LivenessEngine:
         turn_yaw_deg: float = 15.0,
         pad_model_path: str = "",
         pad_threshold: float = 0.5,
+        pad_min_live_frames: int = 3,
     ) -> None:
         self.mode = mode
         self.phase = phase
         self.challenge_timeout_s = int(challenge_timeout_s)
         self.turn_yaw_deg = float(turn_yaw_deg)
+        # Passive-PAD temporal quorum: require this many frames in the burst to
+        # INDEPENDENTLY clear the PAD threshold (k-of-n, mirrors recognition's
+        # match_votes). >= 1; a burst with fewer valid frames can never satisfy
+        # it and fails closed (I2). Replaces the old max-across-frames aggregate.
+        self.pad_min_live_frames = max(1, int(pad_min_live_frames))
         # Normalized asymmetry threshold from the requested turn angle.
         self.pos_threshold = math.sin(math.radians(self.turn_yaw_deg))
         self.frontal_tol = 0.15
@@ -452,17 +472,28 @@ class LivenessEngine:
         if self._pad is None or not self._pad.available:
             # Hardening mode selected but model not provisioned -> fail closed.
             return LivenessResult(False, "passive:model-unavailable", 0.0)
-        best = 0.0
-        scored = 0
+        # I2: aggregate per-frame fused-live scores with a k-of-n QUORUM, not
+        # ``max``. ``max`` is the most permissive temporal estimator -- a single
+        # lucky replay/glare frame above threshold would pass = fail-OPEN on the
+        # time axis. Instead require ``pad_min_live_frames`` (k) frames to
+        # INDEPENDENTLY clear the threshold. Equivalently, the k-th largest
+        # per-frame score must be >= threshold; if fewer than k frames scored at
+        # all, the quorum is unreachable -> deny.
+        scores: list[float] = []
         for obs in observations:
             s = self._pad.score_crops(getattr(obs, "pad_crops", None))
             if s is not None:
-                scored += 1
-                best = max(best, s)
-        if scored == 0:
+                scores.append(float(s))
+        if not scores:
             # No usable crops in any frame -> fail closed (design 2.4).
             return LivenessResult(False, "passive:no-crops", 0.0)
-        return LivenessResult(best >= self._pad.threshold, "passive", best)
+        k = self.pad_min_live_frames
+        if len(scores) < k:
+            # Fewer valid frames than the required live quorum -> fail closed.
+            return LivenessResult(False, "passive:insufficient-live-frames", 0.0)
+        # k-th largest per-frame score: >= threshold IFF at least k frames pass.
+        quorum_score = sorted(scores, reverse=True)[k - 1]
+        return LivenessResult(quorum_score >= self._pad.threshold, "passive", quorum_score)
 
     def check(
         self,
