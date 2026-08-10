@@ -41,6 +41,8 @@ __all__ = [
     "higher_is_better_for_metric",
     "fmr_at_tau",
     "fnmr_at_tau",
+    "fmr_count_at_tau",
+    "fnmr_count_at_tau",
     "sweep_thresholds",
     "det_points",
     "tau_at_fmr",
@@ -88,6 +90,30 @@ def _as_1d(scores) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 # Per-comparison rates at a fixed threshold.
 # --------------------------------------------------------------------------- #
+def fmr_count_at_tau(impostor_scores, tau: float, higher_is_better: bool = True) -> int:
+    """Number of impostor comparisons ACCEPTED at ``tau`` (the raw false-match count).
+
+    Carrying the integer count (rather than reconstructing it as
+    ``round(rate * n)``) is what lets the Wilson CI use the exact success count,
+    avoiding a float round-trip that can be off by one at large ``n`` (the A1
+    minor fix).
+    """
+    imp = _as_1d(impostor_scores)
+    if imp.size == 0:
+        return 0
+    accept = imp >= tau if higher_is_better else imp <= tau
+    return int(np.count_nonzero(accept))
+
+
+def fnmr_count_at_tau(genuine_scores, tau: float, higher_is_better: bool = True) -> int:
+    """Number of genuine comparisons REJECTED at ``tau`` (the raw false-non-match count)."""
+    gen = _as_1d(genuine_scores)
+    if gen.size == 0:
+        return 0
+    reject = gen < tau if higher_is_better else gen > tau
+    return int(np.count_nonzero(reject))
+
+
 def fmr_at_tau(impostor_scores, tau: float, higher_is_better: bool = True) -> float:
     """False Match Rate at ``tau``: fraction of impostor scores that ACCEPT.
 
@@ -96,8 +122,7 @@ def fmr_at_tau(impostor_scores, tau: float, higher_is_better: bool = True) -> fl
     imp = _as_1d(impostor_scores)
     if imp.size == 0:
         return 0.0
-    accept = imp >= tau if higher_is_better else imp <= tau
-    return float(np.count_nonzero(accept)) / float(imp.size)
+    return fmr_count_at_tau(imp, tau, higher_is_better) / float(imp.size)
 
 
 def fnmr_at_tau(genuine_scores, tau: float, higher_is_better: bool = True) -> float:
@@ -108,8 +133,7 @@ def fnmr_at_tau(genuine_scores, tau: float, higher_is_better: bool = True) -> fl
     gen = _as_1d(genuine_scores)
     if gen.size == 0:
         return 0.0
-    reject = gen < tau if higher_is_better else gen > tau
-    return float(np.count_nonzero(reject)) / float(gen.size)
+    return fnmr_count_at_tau(gen, tau, higher_is_better) / float(gen.size)
 
 
 # --------------------------------------------------------------------------- #
@@ -197,8 +221,11 @@ def fnmr_at_fmr(
     """
     gen = _as_1d(genuine_scores)
     tau = tau_at_fmr(impostor_scores, fmr_target, higher_is_better)
-    rate = fnmr_at_tau(gen, tau, higher_is_better)
-    ci = wilson(int(round(rate * gen.size)), int(gen.size))
+    # A1 fix: feed the raw reject COUNT to Wilson (never round(rate * n), which
+    # can drift by one at large n and mis-state the interval).
+    count = fnmr_count_at_tau(gen, tau, higher_is_better)
+    rate = 0.0 if gen.size == 0 else count / float(gen.size)
+    ci = wilson(count, int(gen.size))
     return OperatingPoint(tau=float(tau), rate=float(rate), ci=ci)
 
 
@@ -211,8 +238,10 @@ def fmr_at_fnmr(
     """
     imp = _as_1d(impostor_scores)
     tau = tau_at_fnmr(genuine_scores, fnmr_target, higher_is_better)
-    rate = fmr_at_tau(imp, tau, higher_is_better)
-    ci = wilson(int(round(rate * imp.size)), int(imp.size))
+    # A1 fix: exact accept COUNT into Wilson (not round(rate * n)).
+    count = fmr_count_at_tau(imp, tau, higher_is_better)
+    rate = 0.0 if imp.size == 0 else count / float(imp.size)
+    ci = wilson(count, int(imp.size))
     return OperatingPoint(tau=float(tau), rate=float(rate), ci=ci)
 
 

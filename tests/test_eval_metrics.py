@@ -143,6 +143,34 @@ def test_fmr_at_fnmr_target_known_answer():
     assert M.fnmr_at_tau(GEN, op.tau) <= 0.2 + 1e-12
 
 
+def test_operating_point_ci_uses_exact_success_count_a1_fix():
+    # A1 minor fix: the operating-point Wilson CI must be built from the RAW
+    # integer success count (count_nonzero at the chosen tau), not the
+    # float-reconstructed round(rate * n). Verify both operating points feed the
+    # exact count/N to the same wilson estimator the report will call.
+    rng = np.random.default_rng(3)
+    gen = rng.normal(0.6, 0.1, 400)
+    imp = rng.normal(0.2, 0.1, 4000)
+
+    op_fnmr = M.fnmr_at_fmr(gen, imp, fmr_target=1e-2)
+    exact_reject = M.fnmr_count_at_tau(gen, op_fnmr.tau)
+    assert op_fnmr.ci == M.wilson(exact_reject, gen.size)
+    assert op_fnmr.rate == pytest.approx(exact_reject / gen.size)
+
+    op_fmr = M.fmr_at_fnmr(gen, imp, fnmr_target=0.05)
+    exact_accept = M.fmr_count_at_tau(imp, op_fmr.tau)
+    assert op_fmr.ci == M.wilson(exact_accept, imp.size)
+    assert op_fmr.rate == pytest.approx(exact_accept / imp.size)
+
+
+def test_count_helpers_match_rate_times_n():
+    # The integer count and the float rate agree exactly on the reference set.
+    assert M.fmr_count_at_tau(IMP, 0.5) == 2          # {0.5, 0.6}
+    assert M.fnmr_count_at_tau(GEN, 0.6) == 2         # {0.4, 0.5}
+    assert M.fmr_count_at_tau(IMP, 0.5) / IMP.size == pytest.approx(M.fmr_at_tau(IMP, 0.5))
+    assert M.fnmr_count_at_tau(GEN, 0.6) / GEN.size == pytest.approx(M.fnmr_at_tau(GEN, 0.6))
+
+
 def test_tau_at_fmr_matches_shipped_calibrator_logic():
     # metrics.tau_at_fmr must not silently diverge from the deployed calibrator
     # (calibrate._tau_at_fmr_cosine); drift here would move the shipped tau.

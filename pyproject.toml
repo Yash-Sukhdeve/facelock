@@ -42,6 +42,7 @@ test = ["pytest>=8,<10"]
 facelock = "facelock.cli:main"
 facelockd = "facelock.daemon:main"
 facelock-guardian = "facelock.guardian:main"
+facelock-eval = "facelock.eval.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
