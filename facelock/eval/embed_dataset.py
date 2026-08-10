@@ -252,6 +252,7 @@ def embed_lfw(
     model_id: str = "",
     expected_model_id: str | None = None,
     fetch: Callable[..., Any] | None = None,
+    resize: float = 2.0,
 ) -> DatasetEmbeddings:
     """Embed the LFW dataset through the deployed pipeline (protocol §2b).
 
@@ -261,6 +262,16 @@ def embed_lfw(
     single image per unique identity -- the *independent-comparison* primary
     estimate (protocol §2b independence note); the default keeps every valid
     image (the correlated secondary/sensitivity estimate).
+
+    ``resize`` is forwarded to ``fetch_lfw_people`` verbatim. sklearn's own
+    default is ``resize=0.5``, which shrinks LFW's already-small source images
+    to ~62x47 px -- a face there is only ~40px, BELOW the deployed detector's
+    ``min_face_px`` gate (80 by default), so the exactly-one-face gate silently
+    rejects every image and the impostor set comes back empty. Empirically:
+    ``resize=0.5`` -> 0/40 faces pass the gate; ``resize=1.0`` -> ~85px faces
+    (37/40 pass); ``resize=2.0`` -> ~184px faces (40/40 pass). The default here
+    is therefore ``2.0``, comfortably clearing an 80px gate; pass a smaller
+    value only if the deployed ``min_face_px`` is known to be lower.
 
     ``fetch`` is an injection seam for tests; production leaves it ``None`` and
     the real loader is used. LFW pixels are streamed and never persisted -- only
@@ -279,7 +290,10 @@ def embed_lfw(
     except Exception:
         sklearn_version = ""
 
-    data = fetch(color=True, funneled=funneled, min_faces_per_person=min_faces_per_person)
+    data = fetch(
+        color=True, funneled=funneled, min_faces_per_person=min_faces_per_person,
+        resize=resize,
+    )
     images = np.asarray(data.images)
     n_images = int(images.shape[0])
 
@@ -314,6 +328,7 @@ def embed_lfw(
             "n_identities": int(n_identities),
             "one_per_identity": bool(one_per_identity),
             "min_faces_per_person": int(min_faces_per_person),
+            "resize": float(resize),
         },
     )
     return result

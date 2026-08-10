@@ -167,6 +167,7 @@ def cmd_embed(args: argparse.Namespace) -> int:
                 min_faces_per_person=int(args.min_faces),
                 one_per_identity=bool(args.one_per_identity),
                 model_id=model_id, expected_model_id=expected,
+                resize=float(args.resize),
             )
         else:
             result = ED.embed_image_dir(
@@ -227,6 +228,10 @@ def build_parser() -> argparse.ArgumentParser:
                          help="LFW: min_faces_per_person filter")
     p_embed.add_argument("--one-per-identity", action="store_true",
                          help="LFW: keep one image per identity (independent estimate)")
+    p_embed.add_argument("--resize", type=float, default=2.0,
+                         help="LFW: fetch_lfw_people resize factor (default 2.0 -- keeps "
+                              "faces above min_face_px; sklearn's own default of 0.5 "
+                              "shrinks faces below the detector's gate)")
     p_embed.set_defaults(func=cmd_embed)
     return parser
 

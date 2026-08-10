@@ -110,6 +110,24 @@ def build_report(
     gen = _as_matrix(genuine)
     imp = _as_matrix(impostor)
 
+    # Fail CLEARLY on an empty probe set instead of letting an empty impostor
+    # array fall through to `calibrate._tau_at_fmr_cosine`, which indexes
+    # `scores[-1]` on a zero-length sorted array (IndexError) -- e.g. every LFW
+    # image dropped by the one-face gate because `embed_lfw`'s `resize` shrank
+    # faces below `min_face_px`. Checked BEFORE any scoring/metric call so the
+    # failure is diagnosable from the message alone, not a stack trace.
+    if imp.shape[0] == 0:
+        raise ValueError(
+            "impostor set is empty -- check min_face_px vs image resize "
+            "(embed_lfw's `resize` must keep faces above the detector's "
+            "min_face_px gate; the default resize=2.0 does this for LFW)"
+        )
+    if gen.shape[0] == 0:
+        raise ValueError(
+            "genuine set is empty -- check min_face_px vs image resize/capture "
+            "quality (the one-face gate dropped every genuine probe image)"
+        )
+
     # --- D-1: score through the EXACT deployed matcher at the LIVE pose_max. ---
     gen_scores = scoring.score_probes(template, gen, pose_max=pose_max)
     imp_scores = scoring.score_probes(template, imp, pose_max=pose_max)

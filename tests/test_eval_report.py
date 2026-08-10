@@ -136,6 +136,28 @@ def test_operating_point_ci_from_exact_count_a1_fix():
 
 
 # --------------------------------------------------------------------------- #
+# Empty probe sets must fail with a CLEAR error, not an opaque IndexError from
+# `calibrate._tau_at_fmr_cosine` (which indexes ``scores[-1]`` on a zero-length
+# sorted array once every impostor image is dropped by the one-face gate --
+# e.g. LFW faces shrunk below ``min_face_px`` by an unset ``resize``).
+# --------------------------------------------------------------------------- #
+def test_build_report_raises_clear_error_on_empty_impostor():
+    tmpl = make_template(tau=0.3, n=8)
+    gen = genuine_probes(m=10)
+    imp = np.empty((0, 128), dtype=np.float32)
+    with pytest.raises(ValueError, match="impostor"):
+        report.build_report(tmpl, gen, imp, pose_max=5, bootstrap=0)
+
+
+def test_build_report_raises_clear_error_on_empty_genuine():
+    tmpl = make_template(tau=0.3, n=8)
+    gen = np.empty((0, 128), dtype=np.float32)
+    imp = generate_synthetic_impostors(n=100, seed=13)
+    with pytest.raises(ValueError, match="genuine"):
+        report.build_report(tmpl, gen, imp, pose_max=5, bootstrap=0)
+
+
+# --------------------------------------------------------------------------- #
 # THE load-bearing requirement: live pose_max is threaded into the scorer.
 # --------------------------------------------------------------------------- #
 def test_report_threads_pose_max_into_scorer(monkeypatch):
@@ -303,3 +325,57 @@ def test_cli_embed_dir_end_to_end(tmp_path, monkeypatch):
     assert emb.shape == (2, 128)
     assert meta["model_id"] == "mid"
     assert stat.S_IMODE(out.stat().st_mode) == 0o600
+
+
+def test_cli_embed_lfw_threads_resize_arg(tmp_path, monkeypatch):
+    """--resize must reach embed_lfw's `resize` kwarg (default 2.0 keeps LFW
+    faces above min_face_px; a caller can override it)."""
+    from facelock.eval import cli as eval_cli
+    import tests.test_eval_embed as te
+
+    monkeypatch.setattr(
+        ED, "build_pipeline",
+        lambda *a, **k: (te.FakeDetector(), te.FakeEmbedder(), "mid"),
+    )
+    _write_config(pose_max=5)
+
+    calls: dict = {}
+
+    def fake_embed_lfw(detector, embedder, **kwargs):
+        calls.update(kwargs)
+        return ED.DatasetEmbeddings(
+            embeddings=np.zeros((0, 128), dtype=np.float32),
+            provenance={"n_valid": 0, "dataset": "LFW"},
+        )
+
+    monkeypatch.setattr(ED, "embed_lfw", fake_embed_lfw)
+
+    out = tmp_path / "imp.npz"
+    eval_cli.main(["embed", "--lfw", "--out", str(out), "--resize", "1.5"])
+    assert calls.get("resize") == 1.5
+
+
+def test_cli_embed_lfw_default_resize_is_2_0(tmp_path, monkeypatch):
+    from facelock.eval import cli as eval_cli
+    import tests.test_eval_embed as te
+
+    monkeypatch.setattr(
+        ED, "build_pipeline",
+        lambda *a, **k: (te.FakeDetector(), te.FakeEmbedder(), "mid"),
+    )
+    _write_config(pose_max=5)
+
+    calls: dict = {}
+
+    def fake_embed_lfw(detector, embedder, **kwargs):
+        calls.update(kwargs)
+        return ED.DatasetEmbeddings(
+            embeddings=np.zeros((0, 128), dtype=np.float32),
+            provenance={"n_valid": 0, "dataset": "LFW"},
+        )
+
+    monkeypatch.setattr(ED, "embed_lfw", fake_embed_lfw)
+
+    out = tmp_path / "imp.npz"
+    eval_cli.main(["embed", "--lfw", "--out", str(out)])
+    assert calls.get("resize") == 2.0

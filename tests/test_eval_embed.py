@@ -210,6 +210,51 @@ def test_embed_lfw_flows_without_download(monkeypatch):
     assert res.provenance["n_valid"] == 3
 
 
+# --------------------------------------------------------------------------- #
+# resize forwarding: sklearn's fetch_lfw_people defaults to resize=0.5, which
+# shrinks LFW faces to ~40px -- BELOW the deployed detector's min_face_px gate
+# (80). embed_lfw must forward a caller-controlled `resize` (default 2.0, which
+# empirically keeps faces ~184px, comfortably above the gate) to `fetch` so the
+# one-face gate does not silently reject every image.
+# --------------------------------------------------------------------------- #
+def test_embed_lfw_forwards_resize_to_fetch():
+    import types
+
+    calls: dict = {}
+
+    def spy(**kwargs):
+        calls.update(kwargs)
+        f = np.zeros((40, 40, 3), dtype=np.float32)
+        f[0, 0, 0] = 1 / 255.0     # 1 face
+        f[0, 0, 2] = 1 / 255.0
+        imgs = np.stack([f])
+        return types.SimpleNamespace(
+            images=imgs, target=np.array([0]), target_names=np.array(["a"]),
+        )
+
+    res = ED.embed_lfw(FakeDetector(), FakeEmbedder(), resize=1.7, fetch=spy)
+    assert calls.get("resize") == 1.7
+    assert calls.get("color") is True
+    assert res.embeddings.shape == (1, 128)
+
+
+def test_embed_lfw_default_resize_is_2_0():
+    import types
+
+    calls: dict = {}
+
+    def spy(**kwargs):
+        calls.update(kwargs)
+        return types.SimpleNamespace(
+            images=np.zeros((0, 40, 40, 3), dtype=np.float32),
+            target=np.array([]),
+            target_names=np.array([]),
+        )
+
+    ED.embed_lfw(FakeDetector(), FakeEmbedder(), fetch=spy)
+    assert calls.get("resize") == 2.0
+
+
 def test_embed_lfw_one_per_identity(monkeypatch):
     pytest.importorskip("sklearn")
     import types
