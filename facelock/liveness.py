@@ -43,6 +43,26 @@ except Exception:  # pragma: no cover
     cv2 = None  # type: ignore[assignment]
 
 
+# --------------------------------------------------------------------------- #
+# MiniFASNet / Silent-Face passive-PAD constants (design 2.1-2.3, ADR-7).
+#
+# These are SECURITY-CRITICAL and pinned to the authoritative
+# minivision-ai/Silent-Face-Anti-Spoofing inference recipe (Apache-2.0):
+#   * two crop scales 2.7 (MiniFASNetV2) and 4.0 (MiniFASNetV1SE),
+#   * 80x80 input, BGR order (NO channel swap), pixel scale 1/255, no mean,
+#   * live/bona-fide class == softmax index 1 (classes 0 and 2 are attacks),
+#   * two-scale fusion = mean of the per-scale live probabilities (pred[1]/2).
+# A change to any of these silently disables anti-spoofing; the golden-vector
+# tests in tests/test_pad_core.py exist to make such a regression fail loudly.
+# --------------------------------------------------------------------------- #
+PAD_INPUT_SIZE = 80
+PAD_SCALE_V2 = 2.7  # MiniFASNetV2, 2.7_80x80
+PAD_SCALE_V1SE = 4.0  # MiniFASNetV1SE, 4_0_0_80x80
+PAD_SCALES = (PAD_SCALE_V2, PAD_SCALE_V1SE)
+PAD_LIVE_INDEX = 1  # Silent-Face bona-fide class (NOT the last class)
+PAD_CLASSES = 3
+
+
 @dataclass
 class Challenge:
     """A liveness challenge issued for one verification attempt."""
@@ -61,11 +81,21 @@ class LivenessResult:
 
 @dataclass
 class LivenessObservation:
-    """One frame's worth of liveness evidence (built by the daemon)."""
+    """One frame's worth of liveness evidence (built by the daemon).
+
+    ``pad_crops`` carries the bbox-context crops the passive MiniFASNet PAD
+    consumes -- one 80x80 BGR crop per scale in :data:`PAD_SCALES`. This is a
+    DIFFERENT distribution from the SFace similarity-warped ``aligned`` crop
+    used for recognition (design 2.2, correction A1): PAD needs the bezel /
+    paper-edge / background context that the recognition warp deliberately
+    removes. ``aligned`` is retained only for the recognition path; passive PAD
+    reads ``pad_crops`` exclusively.
+    """
 
     landmarks: np.ndarray  # shape (5, 2)
     ts: float
-    aligned: np.ndarray | None = None  # aligned BGR crop for passive PAD
+    aligned: np.ndarray | None = None  # SFace aligned crop (recognition only)
+    pad_crops: dict[float, np.ndarray] | None = None  # {scale: 80x80 BGR}
 
 
 def estimate_yaw(landmarks: np.ndarray) -> float:
@@ -87,6 +117,222 @@ def estimate_yaw(landmarks: np.ndarray) -> float:
     return float(max(-1.0, min(1.0, pos)))
 
 
+# --------------------------------------------------------------------------- #
+# T1 -- PAD context cropper (pure, no I/O, no model).
+#
+# Reproduces Silent-Face's ``CropImage`` geometry (design 2.2, correction A1):
+# enlarge the detector bbox by ``scale`` about its centre, clamp the scale so
+# the enlarged box fits the frame, then SLIDE the box back inside the frame
+# edges (never truncated asymmetrically) and resize to ``size`` x ``size``
+# WITHOUT any geometric warp. This is the crop distribution MiniFASNet was
+# trained on; feeding the SFace 112x112 warp instead would silently degrade the
+# model (correction A1).
+# --------------------------------------------------------------------------- #
+def _pad_crop_box(
+    src_w: int, src_h: int, bbox: tuple[float, float, float, float], scale: float
+) -> tuple[int, int, int, int] | None:
+    """Return the integer inclusive box ``(x1, y1, x2, y2)`` for a context crop.
+
+    ``None`` for a degenerate bbox (non-positive width/height) so callers fail
+    closed rather than cropping garbage.
+    """
+    try:
+        x, y, box_w, box_h = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+    except (TypeError, ValueError, IndexError):
+        return None
+    if box_w <= 0.0 or box_h <= 0.0 or src_w <= 1 or src_h <= 1:
+        return None
+
+    # Clamp the requested scale so the enlarged box cannot exceed the frame.
+    scale = min((src_h - 1) / box_h, (src_w - 1) / box_w, float(scale))
+    if scale <= 0.0:
+        return None
+
+    new_w = box_w * scale
+    new_h = box_h * scale
+    center_x = box_w / 2.0 + x
+    center_y = box_h / 2.0 + y
+
+    left_top_x = center_x - new_w / 2.0
+    left_top_y = center_y - new_h / 2.0
+    right_bottom_x = center_x + new_w / 2.0
+    right_bottom_y = center_y + new_h / 2.0
+
+    # Slide the whole box inside the frame (Silent-Face semantics), not truncate.
+    if left_top_x < 0:
+        right_bottom_x -= left_top_x
+        left_top_x = 0.0
+    if left_top_y < 0:
+        right_bottom_y -= left_top_y
+        left_top_y = 0.0
+    if right_bottom_x > src_w - 1:
+        left_top_x -= right_bottom_x - (src_w - 1)
+        right_bottom_x = src_w - 1
+    if right_bottom_y > src_h - 1:
+        left_top_y -= right_bottom_y - (src_h - 1)
+        right_bottom_y = src_h - 1
+
+    x1 = int(max(0.0, left_top_x))
+    y1 = int(max(0.0, left_top_y))
+    x2 = int(min(float(src_w - 1), right_bottom_x))
+    y2 = int(min(float(src_h - 1), right_bottom_y))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
+
+
+def pad_crop(
+    frame_bgr: "np.ndarray | None",
+    bbox: "tuple[float, float, float, float] | None",
+    scale: float,
+    size: int = PAD_INPUT_SIZE,
+) -> "np.ndarray | None":
+    """Return an ``size`` x ``size`` BGR context crop, or ``None`` (fail-closed).
+
+    ``None`` is returned for a missing/empty frame, a degenerate/absent bbox, or
+    any cv2 error -- never a partial or warped crop.
+    """
+    if frame_bgr is None or bbox is None or cv2 is None:
+        return None
+    if getattr(frame_bgr, "size", 0) == 0 or frame_bgr.ndim != 3:
+        return None
+    src_h, src_w = int(frame_bgr.shape[0]), int(frame_bgr.shape[1])
+    box = _pad_crop_box(src_w, src_h, bbox, scale)
+    if box is None:
+        return None
+    x1, y1, x2, y2 = box
+    try:
+        sub = frame_bgr[y1 : y2 + 1, x1 : x2 + 1]
+        if sub.size == 0:
+            return None
+        return cv2.resize(sub, (int(size), int(size)))
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# T3 -- MiniFASNet preprocessing (pure). BGR, NO channel swap, scale 1/255, no
+# mean (design 2.3, correction: swapRB must be False, not True).
+# --------------------------------------------------------------------------- #
+def pad_blob(crop_bgr: "np.ndarray | None", size: int = PAD_INPUT_SIZE) -> "np.ndarray | None":
+    """Return the ``(1, 3, size, size)`` blob MiniFASNet expects, or ``None``.
+
+    swapRB is **False** so the cv2 BGR channel order is preserved into the
+    network (Silent-Face ``ToTensor`` keeps BGR); a True here would feed a
+    channel-flipped image and silently degrade PAD.
+    """
+    if crop_bgr is None or cv2 is None:
+        return None
+    if getattr(crop_bgr, "size", 0) == 0:
+        return None
+    try:
+        return cv2.dnn.blobFromImage(
+            crop_bgr,
+            scalefactor=1.0 / 255.0,
+            size=(int(size), int(size)),
+            mean=(0.0, 0.0, 0.0),
+            swapRB=False,
+            crop=False,
+        )
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# T4 -- decode + two-scale fusion (the SECURITY GATE). live == softmax index 1;
+# fuse two scales as the mean of the per-scale live probabilities (pred[1]/2).
+# --------------------------------------------------------------------------- #
+def pad_softmax(logits: "np.ndarray | list | tuple") -> np.ndarray:
+    """Numerically stable softmax over a 1-D logit vector.
+
+    Raises ``ValueError`` on an empty or non-finite input so the callers below
+    can convert that to a fail-closed ``None``.
+    """
+    arr = np.asarray(logits, dtype=np.float64).reshape(-1)
+    if arr.size == 0:
+        raise ValueError("empty logits")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("non-finite logits")
+    ex = np.exp(arr - arr.max())
+    total = ex.sum()
+    if not np.isfinite(total) or total <= 0.0:
+        raise ValueError("degenerate softmax")
+    return ex / total
+
+
+def pad_live_prob(logits: "np.ndarray | list | tuple | None") -> float | None:
+    """Single-scale bona-fide (live) probability = ``softmax(logits)[1]``.
+
+    Returns ``None`` (fail-closed) for a missing, empty, malformed (fewer than
+    two classes), or non-finite output -- anything that cannot be trusted to
+    address the live class is treated as spoof by the caller.
+    """
+    if logits is None:
+        return None
+    try:
+        probs = pad_softmax(logits)
+    except (ValueError, TypeError):
+        return None
+    if probs.size <= PAD_LIVE_INDEX:
+        return None
+    return float(probs[PAD_LIVE_INDEX])
+
+
+def pad_fuse_live_prob(logits_by_scale: "object") -> float | None:
+    """Two-scale fusion: the mean of the per-scale live probabilities.
+
+    Equivalent to Silent-Face's ``(softmax(net_2.7) + softmax(net_4.0))[1] / 2``.
+    Returns ``None`` (fail-closed) if the iterable is empty/absent or ANY scale
+    yields a degraded output -- a partial fusion never grants.
+    """
+    if logits_by_scale is None:
+        return None
+    probs: list[float] = []
+    for logits in logits_by_scale:
+        p = pad_live_prob(logits)
+        if p is None:
+            return None
+        probs.append(p)
+    if not probs:
+        return None
+    return float(sum(probs) / len(probs))
+
+
+# --------------------------------------------------------------------------- #
+# T2 -- observation build (pure; injectable frame/detection, never a camera).
+# --------------------------------------------------------------------------- #
+def build_liveness_observation(
+    frame_bgr: "np.ndarray | None",
+    ts: float,
+    detection: "object",
+    mode: str,
+    scales: "tuple[float, ...]" = PAD_SCALES,
+) -> LivenessObservation:
+    """Build one :class:`LivenessObservation` for the daemon's frame burst.
+
+    For ``passive`` / ``full`` modes it attaches the bbox-context PAD crops (one
+    per scale) built purely from the detector bbox -- it does NOT reach into the
+    recognition aligner (``embedder.align`` stays recognition-only, design 2.2).
+    For ``off`` / ``turn`` / ``blink`` no crops are built, so those modes are
+    unaffected. A degenerate bbox simply yields no crops (fail-closed), never a
+    crash.
+    """
+    pad_crops: dict[float, np.ndarray] | None = None
+    if mode in ("passive", "full") and frame_bgr is not None:
+        bbox = getattr(detection, "bbox", None)
+        crops: dict[float, np.ndarray] = {}
+        for scale in scales:
+            crop = pad_crop(frame_bgr, bbox, scale)
+            if crop is not None:
+                crops[scale] = crop
+        pad_crops = crops or None
+    return LivenessObservation(
+        landmarks=getattr(detection, "landmarks", None),
+        ts=ts,
+        pad_crops=pad_crops,
+    )
+
+
 class _PassivePAD:
     """MiniFASNet passive PAD hook (Hardening). Runnable if a model is present."""
 
@@ -102,31 +348,41 @@ class _PassivePAD:
             except Exception:
                 self.available = False
 
-    def score(self, aligned_bgr: np.ndarray | None) -> float | None:
-        """Return a bona-fide (live) probability in [0, 1], or ``None``.
+    def score(self, crop_bgr: np.ndarray | None) -> float | None:
+        """Return the single-scale bona-fide (live) probability, or ``None``.
 
-        The exact output mapping must match the provisioned MiniFASNet variant;
-        this generic path softmaxes the network output and returns the "real"
-        class probability (last class by convention). It is a documented
-        Hardening hook -- swap in the model-specific decoding when the model is
-        pinned.
+        Uses the Silent-Face-exact preprocessing (:func:`pad_blob`: BGR, no
+        channel swap, 1/255) and decode (:func:`pad_live_prob`: softmax index 1,
+        NOT the last class). Any missing model, malformed output, or exception
+        returns ``None`` -> the caller fails closed.
         """
-        if not self.available or self._net is None or aligned_bgr is None:
+        if not self.available or self._net is None or crop_bgr is None:
             return None
         try:
-            blob = cv2.dnn.blobFromImage(
-                aligned_bgr, scalefactor=1.0 / 255.0, size=(80, 80),
-                mean=(0, 0, 0), swapRB=True, crop=False,
-            )
+            blob = pad_blob(crop_bgr)
+            if blob is None:
+                return None
             self._net.setInput(blob)
             out = np.asarray(self._net.forward(), dtype=np.float64).reshape(-1)
-            if out.size == 0:
-                return None
-            exp = np.exp(out - out.max())
-            probs = exp / exp.sum()
-            return float(probs[-1])
+            return pad_live_prob(out)
         except Exception:
             return None
+
+    def score_crops(self, pad_crops: "dict[float, np.ndarray] | None") -> float | None:
+        """Return the two-scale FUSED live probability, or ``None`` (deny).
+
+        Runs the net over each provisioned scale crop and fuses via
+        :func:`pad_fuse_live_prob` (mean of the per-scale live probs). If any
+        scale is missing/degraded, or there are no crops, returns ``None`` so
+        the verify path fails closed. (Two distinct per-scale nets are wired in
+        task T5; this single-net path already applies the correct fusion math.)
+        """
+        if not self.available or self._net is None or not pad_crops:
+            return None
+        per_scale = [self.score(pad_crops[scale]) for scale in sorted(pad_crops)]
+        if not per_scale or any(p is None for p in per_scale):
+            return None
+        return float(sum(per_scale) / len(per_scale))
 
 
 class LivenessEngine:
@@ -199,11 +455,12 @@ class LivenessEngine:
         best = 0.0
         scored = 0
         for obs in observations:
-            s = self._pad.score(obs.aligned)
+            s = self._pad.score_crops(getattr(obs, "pad_crops", None))
             if s is not None:
                 scored += 1
                 best = max(best, s)
         if scored == 0:
+            # No usable crops in any frame -> fail closed (design 2.4).
             return LivenessResult(False, "passive:no-crops", 0.0)
         return LivenessResult(best >= self._pad.threshold, "passive", best)
 
