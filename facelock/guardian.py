@@ -228,16 +228,17 @@ class Guardian:
                 continue
             if not self.shield_enabled:
                 continue
+            # The `raise` op is SECURITY-CRITICAL and is handled fail-closed
+            # OUTSIDE the best-effort blanket below (defense-in-depth): a failed
+            # shield-raise must escalate to the real OS lock, never be silently
+            # logged-and-continued. Swallowing it would leave the grant LOCKED
+            # with NO shield and NO OS lock == fail-open. All OTHER shield ops are
+            # cosmetic and stay best-effort (logged + swallowed), unchanged.
+            if op == "raise":
+                self._apply_raise_op(arg)
+                continue
             try:
-                if op == "raise":
-                    # SI-P5 / REQ-F-14: the shield is only a barrier if its input
-                    # grab actually holds. raise_shield returns the VERIFIED grab
-                    # result; an unconfirmed grab (window up but capturing no
-                    # keyboard/pointer) offers no protection, so we fail-closed and
-                    # escalate to the real OS lock rather than trusting it.
-                    if not self.shield.raise_shield(arg or "Locked"):
-                        self._on_shield_grab_unconfirmed()
-                elif op == "status":
+                if op == "status":
                     self.shield.set_status(arg or "Locked")
                 elif op == "checking":
                     prog, vk, vn = arg if arg else (0.0, 0, 0)
@@ -248,7 +249,7 @@ class Guardian:
                     self.shield.set_welcome(arg or self._owner_name)
                 elif op == "dismiss":
                     self.shield.dismiss()
-            except Exception as exc:  # shield errors never crash the guardian
+            except Exception as exc:  # cosmetic shield errors never crash the guardian
                 event(self.log, "shield_error", op=op, error=str(exc))
         # Reconcile the debounced perception DPMS desire ONCE per drain (one main
         # -loop tick). Collapsing here means a rapid recognizing<->locked flap
@@ -256,6 +257,44 @@ class Guardian:
         # last-state de-dupe in _do_screen_* suppresses redundant same-state
         # calls. Cosmetic monitor power only -- never touches shield/grant state.
         self._reconcile_perception_dpms()
+
+    def _apply_raise_op(self, arg: Any) -> None:
+        """Raise the shield, fail-closed on ANY failure (SI-P5 / REQ-F-14).
+
+        The shield is only a barrier if its X11 input grab actually holds. Two
+        failure modes are treated IDENTICALLY and MUST fail-closed:
+
+          * ``raise_shield`` returns ``False`` -- window mapped but the input grab
+            is unconfirmed (capturing no keyboard/pointer); or
+          * ``raise_shield`` RAISES -- the grab path threw (not reachable with
+            today's no-raise ``ShieldWindow``, but a future refactor could make it
+            so, hence this defense-in-depth guard).
+
+        In either case the grab cannot be trusted, so we escalate to the real OS
+        lock EXACTLY ONCE via ``_on_shield_grab_unconfirmed``. Silently logging and
+        continuing (as the best-effort blanket does for cosmetic ops) would leave
+        the grant LOCKED with neither a shield nor an OS lock -- fail-open -- which
+        is precisely what this guard forbids.
+
+        If the escalation ITSELF raises we let it PROPAGATE out of the drain: a
+        guardian crash is fail-closed, and systemd ``Restart=always`` restarts the
+        guardian, which re-raises the shield and re-locks within ~1s. The single
+        escalation call site guarantees no infinite loop and no double-escalation.
+        The normal (grab-confirmed) path is untouched: ``raise_shield`` returns
+        True -> ``grabbed`` True -> no escalation.
+        """
+        try:
+            grabbed = bool(self.shield.raise_shield(arg or "Locked"))
+        except Exception as exc:
+            # raise_shield blew up -> the grab is definitionally unconfirmed. Log
+            # the shield error (parity with the best-effort path) then FALL THROUGH
+            # to the single fail-closed escalation below -- do NOT swallow it.
+            event(self.log, "shield_error", op="raise", error=str(exc))
+            grabbed = False
+        if not grabbed:
+            # Exactly-once fail-closed escalation. If THIS raises, it propagates
+            # out of the drain (a guardian crash re-locks -- fail-closed).
+            self._on_shield_grab_unconfirmed()
 
     # -- monitor power (DPMS), executed in the main thread ---------------- #
     def _reconcile_perception_dpms(self) -> None:

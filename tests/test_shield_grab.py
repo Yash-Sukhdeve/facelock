@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import os
 
+import pytest
+
 from facelock.config import load_config
 from facelock.guardian import Guardian
 
@@ -233,3 +235,140 @@ def test_shieldwindow_local_grab_fallback_confirmed():
     s._root = _FakeRoot("local", global_raises=True)
     assert s._grab() is True
     assert s._grab_confirmed() is True
+
+
+# --------------------------------------------------------------------------- #
+# Defense-in-depth (whole-branch review): a `raise` op that RAISES (rather than
+# returning False) must STILL fail-closed. Today's ShieldWindow.raise_shield
+# never raises (grab failure -> returns False), so this path is not reachable in
+# production -- but a future refactor of the grab path could make it throw. If
+# such an exception were swallowed by the drain's best-effort `try/except`, the
+# grant would stay LOCKED with NO shield and NO OS lock == FAIL-OPEN. These tests
+# pin that a raising `raise` op escalates exactly like a False return, while a
+# raising NON-`raise` op stays best-effort (logged + swallowed), unchanged.
+# --------------------------------------------------------------------------- #
+class _RaiseThrowingShield(_GrabReportingShield):
+    """Fake shield whose ``raise_shield`` RAISES on a lock event.
+
+    Models the theoretical future where the grab path throws instead of
+    returning False. Every other op behaves like the base fake.
+    """
+
+    def __init__(self, exc: Exception | None = None) -> None:
+        super().__init__(grab_ok=False)
+        self._exc = exc or RuntimeError("X server gone: cannot map/grab shield")
+
+    def raise_shield(self, status: str = "Locked") -> bool:
+        self.raises += 1
+        self.is_up = True          # the window "maps" ...
+        raise self._exc            # ... but raising the shield THROWS
+
+
+class _StatusThrowingShield(_GrabReportingShield):
+    """Confirmed grab, but a NON-`raise` op (``set_status``) RAISES.
+
+    Used to pin that non-`raise` shield errors stay best-effort (swallowed +
+    logged) and are NOT promoted to an OS-lock escalation by the fix.
+    """
+
+    def set_status(self, s: str) -> None:
+        raise RuntimeError("set_status blew up")
+
+
+class _EngageThrowingController(FakeController):
+    """Lock controller whose ``engage`` RAISES, to prove the fail-closed
+    escalation is attempted exactly once and, when it too fails, PROPAGATES
+    (a guardian crash is fail-closed; systemd ``Restart=always`` re-locks)."""
+
+    def engage(self):  # type: ignore[override]
+        self.engage_calls += 1
+        raise RuntimeError("loginctl backend exploded")
+
+
+def _guardian_with(shield, log, controller=None):
+    cfg = load_config(raw={})
+    g = Guardian(
+        cfg,
+        lock_controller=controller or FakeController(),
+        shield=shield,
+        display=FakeDisplay(),
+        logger=log,
+        install_signals=False,
+    )
+    g._welcome_hold_s = 0.0
+    g._owner_present = True
+    return g
+
+
+def test_raise_op_that_raises_still_fails_closed():
+    """RED before the fix: if ``raise_shield`` RAISES, the drain's blanket
+    ``except`` logs ``shield_error`` and continues -- swallowing the escalation
+    and leaving the session LOCKED with no shield and no OS lock (FAIL-OPEN).
+
+    After the fix a raising ``raise`` op is treated exactly like a False return:
+    the guardian escalates to the real OS lock (``engage`` called /
+    ``os_lock_escalation`` + ``shield_grab_unconfirmed`` logged) and wakes the
+    monitor for the required password prompt.
+    """
+    log = _RecordingLogger()
+    g = _guardian_with(_RaiseThrowingShield(), log)
+    resp = g.dispatch({"cmd": "lock", "reason": "away"}, UID)
+    assert resp["ok"] and resp["state"] == "LOCKED"
+    # The grab result / exception surfaces only on the main-thread drain.
+    g._drain_shield_queue()
+    assert g.lock_ctl.engage_calls >= 1, (
+        "raise_shield exception was swallowed -- guardian did NOT escalate "
+        "(FAIL-OPEN: LOCKED with no shield and no OS lock)"
+    )
+    assert log.events("os_lock_escalation"), "no os_lock_escalation logged"
+    assert log.events("shield_grab_unconfirmed"), "grab failure not logged"
+    assert g.display.on_calls >= 1                 # monitor woken for the prompt
+
+
+def test_raise_op_exception_is_not_silently_swallowed():
+    """A raising ``raise`` op must NOT be logged-and-continued as a benign
+    ``shield_error`` with no protective action -- that swallow IS the fail-open.
+
+    Pins the security invariant directly: after the drain, either the OS lock was
+    engaged OR the exception propagated (a crash re-locks). It is never the case
+    that the drain returned quietly having taken NO protective action.
+    """
+    log = _RecordingLogger()
+    g = _guardian_with(_RaiseThrowingShield(), log)
+    g.dispatch({"cmd": "lock", "reason": "stranger"}, UID)
+    g._drain_shield_queue()
+    assert g.lock_ctl.engage_calls >= 1, "raise-op failure produced no protective action"
+
+
+def test_non_raise_op_that_raises_is_still_swallowed_and_logged():
+    """COMPANION (unchanged behaviour): a NON-`raise` op that raises stays
+    best-effort -- it is logged as ``shield_error`` and swallowed, and it MUST
+    NOT trigger an OS-lock escalation. This passes both before and after the fix,
+    proving the change is scoped to the `raise` op only."""
+    log = _RecordingLogger()
+    g = _guardian_with(_StatusThrowingShield(grab_ok=True), log)
+    # A bare cosmetic status op (no lock) that will raise inside the drain.
+    g._enqueue_shield("status", "Locked - away")
+    g._drain_shield_queue()                        # must NOT crash
+    assert g.lock_ctl.engage_calls == 0, "a non-raise shield error must NOT escalate"
+    assert log.events("shield_error"), "non-raise shield error was not logged"
+    assert not log.events("os_lock_escalation"), "non-raise error wrongly escalated"
+
+
+def test_raise_op_failclosed_escalation_that_also_raises_propagates_once():
+    """If the fail-closed escalation ITSELF raises, it must PROPAGATE out of the
+    drain (a guardian crash is fail-closed; systemd ``Restart=always`` re-locks in
+    ~1s) rather than being swallowed -- and the escalation is attempted EXACTLY
+    once (no infinite loop / double-escalation).
+
+    RED before the fix too: today the blanket ``except`` catches the
+    ``raise_shield`` exception first and never even attempts the escalation, so
+    nothing propagates (``pytest.raises`` would not fire) and ``engage`` is 0.
+    """
+    log = _RecordingLogger()
+    g = _guardian_with(_RaiseThrowingShield(), log,
+                       controller=_EngageThrowingController())
+    g.dispatch({"cmd": "lock", "reason": "away"}, UID)
+    with pytest.raises(RuntimeError):
+        g._drain_shield_queue()
+    assert g.lock_ctl.engage_calls == 1, "escalation must be attempted EXACTLY once"
