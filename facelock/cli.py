@@ -190,6 +190,11 @@ def cmd_config_check(args: argparse.Namespace) -> int:
     print(f"config OK (phase={cfg.phase}, source={cfg.source_path or 'defaults'})")
     for warn in cfg.warnings:
         print(f"  warning: {warn}")
+    # Loud fail-safe: a persisted dry-run config does NOT protect the session
+    # (OS-lock actuation disabled). install.sh must never write this (DES-DRYRUN).
+    if cfg.security.dry_run:
+        print("WARNING: security.dry_run=true -- this config does NOT protect the "
+              "session; OS-lock actuation is DISABLED (no loginctl/gdbus/xdg).")
     return 0
 
 

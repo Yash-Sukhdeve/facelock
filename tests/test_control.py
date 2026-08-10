@@ -84,6 +84,34 @@ def test_refresh_challenge_makes_late_unlock_succeed():
     assert ga.validate_grant(nonce2, epoch2)[0] is False
 
 
+def test_grant_expired_if_submitted_long_after_last_refresh_challenge():
+    """Task-4 gap fill: the anti-lockout fix (refresh_challenge re-stamping
+    issued_at) must NOT become a way to bypass expiry altogether. A grant
+    fetched via refresh_challenge is still bound to window_s measured from that
+    LAST refresh -- if the daemon (or a replayed/delayed submission) is slower
+    than window_s AFTER the refresh, it must still be rejected "expired".
+
+    This is not covered by test_expired_grant_rejected (which never calls
+    refresh_challenge) nor by test_refresh_challenge_makes_late_unlock_succeed
+    (which validates immediately after refreshing, with no further delay). A
+    plausible bad "fix" for the expired-grant lockout bug is to make a
+    refreshed nonce unconditionally fresh (skip the window_s check once
+    refresh_challenge has been called) -- that would quietly reopen a replay/
+    stale-grant window. See scratch proof in the Task-4 report: a
+    GrantAuthority subclass that drops the expiry check post-refresh makes
+    this exact assertion fail (ok=True, why="ok" instead of expired).
+    """
+    clk = Clock()
+    ga = GrantAuthority(window_s=4.0, now_fn=clk)
+    _l, epoch, nonce = ga.current()
+    clk.t += 300.0  # owner away a long time
+    locked, epoch2, nonce2 = ga.refresh_challenge()
+    assert locked and nonce2 == nonce  # refresh re-stamps issued_at, not the nonce/epoch
+    clk.t += 10.0  # slower than window_s (4s) AFTER the refresh itself
+    ok, why = ga.validate_grant(nonce2, epoch2)
+    assert not ok and why == "expired"
+
+
 def test_force_locked_relocks():
     ga = GrantAuthority()
     _l, epoch, nonce = ga.current()

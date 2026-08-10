@@ -30,11 +30,16 @@ from pathlib import Path
 from typing import Any
 
 from . import paths as _paths
-from .config import Config, load_config
+from .config import (
+    Config,
+    DryRunUnderSystemdError,
+    load_config,
+    resolve_dry_run,
+)
 from .control import ControlServer, GrantAuthority
 from .display import DisplayController
-from .lock_backend import LockController, select_backends
-from .logging_setup import AuditLog, event, get_logger
+from .lock_backend import DryRunLockController, LockController, select_backends
+from .logging_setup import AuditLog, emit_dry_run_banner, event, get_logger
 from .shield import Greeter, ShieldWindow
 from .store import TemplateStore
 
@@ -86,8 +91,15 @@ class Guardian:
         display: DisplayController | None = None,
         logger: Any = None,
         install_signals: bool = True,
+        dry_run: bool | None = None,
     ) -> None:
         self.cfg = config
+        # SAFE dry-run mode (DES-DRYRUN): effective value is the CLI-resolved
+        # override (from main(), which OR-combines --dry-run with config and
+        # applies the systemd gate) or, when unset, the config key directly so
+        # EVERY construction path is covered. dry-run swaps only the OS-lock
+        # ACTUATOR; all decision logic (shield/nonce/FSM/watchdog) is untouched.
+        self._dry_run = bool(config.security.dry_run if dry_run is None else dry_run)
         self.log = logger or get_logger(
             "facelock.guardian",
             level=config.logging.level,
@@ -100,11 +112,19 @@ class Guardian:
             enabled=bool(config.security.audit),
         )
         self.grant = GrantAuthority(window_s=float(config.liveness.challenge_timeout_s))
-        self.lock_ctl = lock_controller or LockController(
-            select_backends(config.lock.backend),
-            verify_engaged_ms=config.lock.verify_engaged_ms,
-            logger=self.log,
-        )
+        # Single additive seam: an injected controller always wins (tests); else
+        # in dry-run build the no-op DryRunLockController; else -- byte-for-byte
+        # the original REAL controller (dry-run NEVER weakens real mode).
+        if lock_controller is not None:
+            self.lock_ctl = lock_controller
+        elif self._dry_run:
+            self.lock_ctl = DryRunLockController(logger=self.log)
+        else:
+            self.lock_ctl = LockController(
+                select_backends(config.lock.backend),
+                verify_engaged_ms=config.lock.verify_engaged_ms,
+                logger=self.log,
+            )
         self.shield_enabled = bool(config.lock.shield)
         self.shield = shield if shield is not None else ShieldWindow(
             owner_name=config.unlock.owner_name,
@@ -141,9 +161,22 @@ class Guardian:
         # activity/DPMS timers, so while the shield is up we re-issue "force off"
         # on this cadence. This never touches the camera/perception (that runs in
         # facelockd), so the owner's return is still detected and wakes the screen.
+        # The cadence is deliberately SLOW: a 3s cadence spawned 42,336 `xset`
+        # off events in one locked-away session (FM-DPMS). 30s keeps the OFF
+        # intent (fights X's wake timers) at ~1/10th the subprocess volume.
         self._screen_off_active = False
-        self._screen_reassert_s = 3.0
+        self._screen_reassert_s = 30.0
         self._last_screen_assert = 0.0
+        # Last DPMS state we actually issued (None = unknown at boot). Guards
+        # against re-spawning `xset` for a state the monitor is already in
+        # (de-dupe of redundant same-state screen_on/screen_off calls).
+        self._last_dpms_on: bool | None = None
+        # Debounced perception DPMS desire, set by shield_status and reconciled
+        # ONCE per shield-queue drain (one main-loop tick). This collapses a rapid
+        # recognizing<->locked flap into at most one real transition per tick.
+        # None = no pending desire. DPMS is cosmetic monitor power ONLY; this
+        # never gates lock/shield authority (fail-closed posture is untouched).
+        self._dpms_desired: bool | None = None
 
         self._shield_q: "queue.Queue[tuple[str, Any]]" = queue.Queue()
         self._server: ControlServer | None = None
@@ -171,6 +204,12 @@ class Guardian:
 
     # -- shield queue (executed in main thread) --------------------------- #
     def _enqueue_shield(self, op: str, arg: Any = None) -> None:
+        # An authoritative DPMS decision (lock/unlock/escalation enqueues
+        # screen_on/screen_off) supersedes any pending debounced perception
+        # desire, so a stale shield_status frame cannot re-toggle the monitor
+        # behind an explicit lock/unlock/password action.
+        if op in ("screen_on", "screen_off"):
+            self._dpms_desired = None
         self._shield_q.put((op, arg))
 
     def _drain_shield_queue(self) -> None:
@@ -189,10 +228,17 @@ class Guardian:
                 continue
             if not self.shield_enabled:
                 continue
+            # The `raise` op is SECURITY-CRITICAL and is handled fail-closed
+            # OUTSIDE the best-effort blanket below (defense-in-depth): a failed
+            # shield-raise must escalate to the real OS lock, never be silently
+            # logged-and-continued. Swallowing it would leave the grant LOCKED
+            # with NO shield and NO OS lock == fail-open. All OTHER shield ops are
+            # cosmetic and stay best-effort (logged + swallowed), unchanged.
+            if op == "raise":
+                self._apply_raise_op(arg)
+                continue
             try:
-                if op == "raise":
-                    self.shield.raise_shield(arg or "Locked")
-                elif op == "status":
+                if op == "status":
                     self.shield.set_status(arg or "Locked")
                 elif op == "checking":
                     prog, vk, vn = arg if arg else (0.0, 0, 0)
@@ -203,12 +249,75 @@ class Guardian:
                     self.shield.set_welcome(arg or self._owner_name)
                 elif op == "dismiss":
                     self.shield.dismiss()
-            except Exception as exc:  # shield errors never crash the guardian
+            except Exception as exc:  # cosmetic shield errors never crash the guardian
                 event(self.log, "shield_error", op=op, error=str(exc))
+        # Reconcile the debounced perception DPMS desire ONCE per drain (one main
+        # -loop tick). Collapsing here means a rapid recognizing<->locked flap
+        # queued within a tick applies at most one real transition, and the
+        # last-state de-dupe in _do_screen_* suppresses redundant same-state
+        # calls. Cosmetic monitor power only -- never touches shield/grant state.
+        self._reconcile_perception_dpms()
+
+    def _apply_raise_op(self, arg: Any) -> None:
+        """Raise the shield, fail-closed on ANY failure (SI-P5 / REQ-F-14).
+
+        The shield is only a barrier if its X11 input grab actually holds. Two
+        failure modes are treated IDENTICALLY and MUST fail-closed:
+
+          * ``raise_shield`` returns ``False`` -- window mapped but the input grab
+            is unconfirmed (capturing no keyboard/pointer); or
+          * ``raise_shield`` RAISES -- the grab path threw (not reachable with
+            today's no-raise ``ShieldWindow``, but a future refactor could make it
+            so, hence this defense-in-depth guard).
+
+        In either case the grab cannot be trusted, so we escalate to the real OS
+        lock EXACTLY ONCE via ``_on_shield_grab_unconfirmed``. Silently logging and
+        continuing (as the best-effort blanket does for cosmetic ops) would leave
+        the grant LOCKED with neither a shield nor an OS lock -- fail-open -- which
+        is precisely what this guard forbids.
+
+        If the escalation ITSELF raises we let it PROPAGATE out of the drain: a
+        guardian crash is fail-closed, and systemd ``Restart=always`` restarts the
+        guardian, which re-raises the shield and re-locks within ~1s. The single
+        escalation call site guarantees no infinite loop and no double-escalation.
+        The normal (grab-confirmed) path is untouched: ``raise_shield`` returns
+        True -> ``grabbed`` True -> no escalation.
+        """
+        try:
+            grabbed = bool(self.shield.raise_shield(arg or "Locked"))
+        except Exception as exc:
+            # raise_shield blew up -> the grab is definitionally unconfirmed. Log
+            # the shield error (parity with the best-effort path) then FALL THROUGH
+            # to the single fail-closed escalation below -- do NOT swallow it.
+            event(self.log, "shield_error", op="raise", error=str(exc))
+            grabbed = False
+        if not grabbed:
+            # Exactly-once fail-closed escalation. If THIS raises, it propagates
+            # out of the drain (a guardian crash re-locks -- fail-closed).
+            self._on_shield_grab_unconfirmed()
 
     # -- monitor power (DPMS), executed in the main thread ---------------- #
+    def _reconcile_perception_dpms(self) -> None:
+        """Apply the latest debounced perception DPMS desire (main thread)."""
+        want = self._dpms_desired
+        if want is None:
+            return
+        self._dpms_desired = None
+        if want:
+            self._do_screen_on()
+        else:
+            self._do_screen_off()
+
     def _do_screen_off(self) -> None:
-        """Blank the monitor and arm the re-assert cadence (main thread)."""
+        """Blank the monitor and arm the slow re-assert cadence (main thread).
+
+        De-duped: if the monitor is already known-blanked we keep the OFF
+        *intent* (the slow re-assert still fights X's wake timers) but do NOT
+        re-spawn `xset`, so a stream of 'locked' frames cannot strobe the display.
+        """
+        if self._last_dpms_on is False:
+            self._screen_off_active = True   # keep intent; no redundant xset
+            return
         try:
             issued = self.display.screen_off()
         except Exception as exc:  # never let display errors crash the guardian
@@ -217,15 +326,47 @@ class Guardian:
         # Only arm the cadence if the command was actually issued; otherwise a
         # disabled/absent display would spin the re-assert loop for nothing.
         self._screen_off_active = bool(issued)
-        self._last_screen_assert = time.monotonic()
+        if issued:
+            self._last_dpms_on = False
+            self._last_screen_assert = time.monotonic()
 
     def _do_screen_on(self) -> None:
-        """Wake the monitor and stop re-asserting (main thread)."""
+        """Wake the monitor and stop re-asserting (main thread).
+
+        De-duped: a repeat 'recognizing' frame while already awake is a no-op
+        (no redundant `xset`), but the re-assert is always disarmed so we never
+        blank behind a present owner.
+        """
         self._screen_off_active = False
+        if self._last_dpms_on is True:
+            return
         try:
             self.display.screen_on()
+            self._last_dpms_on = True
         except Exception as exc:
             event(self.log, "display_error", op="on", error=str(exc))
+
+    def _maybe_reassert_screen(self, now: float) -> bool:
+        """Re-issue DPMS-off on a SLOW cadence while locked-away (main thread).
+
+        Returns True iff it spawned an `xset`. Runs only while the screen is
+        intentionally blanked (``_screen_off_active``) and at most once every
+        ``_screen_reassert_s`` (>=30s). This deliberately re-issues OFF even
+        though we believe the monitor is already off -- its whole job is to fight
+        X waking the display on its own DPMS/activity timers -- so it bypasses the
+        same-state de-dupe. It never blanks a present owner (guarded by
+        ``_screen_off_active``, which ``_do_screen_on`` clears).
+        """
+        if not self._screen_off_active:
+            return False
+        if (now - self._last_screen_assert) < self._screen_reassert_s:
+            return False
+        try:
+            self.display.screen_off()
+        except Exception as exc:
+            event(self.log, "display_error", op="reassert", error=str(exc))
+        self._last_screen_assert = now
+        return True
 
     def _maybe_finish_welcome(self, now: float) -> None:
         """Dismiss the shield once the post-unlock welcome hold elapses.
@@ -245,6 +386,31 @@ class Guardian:
         # they can type, then drop our shield to expose the OS lock.
         self._enqueue_shield("screen_on")
         self._enqueue_shield("dismiss")
+
+    def _on_shield_grab_unconfirmed(self) -> None:
+        """Fail-closed when the shield mapped but its input grab is NOT confirmed.
+
+        SI-P5 / REQ-F-14: a shield that captures no keyboard/pointer is just a
+        picture -- a stranger could interact with the desktop behind it. Such an
+        ungrabbed shield must NEVER be treated as a successful lock. So we do the
+        same verify-and-escalate the OS-lock path uses: engage the REAL OS lock
+        (strictly safer, even though it needs a password) and wake the monitor so
+        the required password prompt is visible.
+
+        Trade-off (intentional): a normally face-dismissible away/stranger lock
+        becomes password-required in this degraded case. Losing face-convenience
+        is acceptable when the alternative is an unprotected session; this fires
+        ONLY when the grab cannot be confirmed, so normal (grabbed) operation --
+        every existing shield test -- is unchanged.
+        """
+        event(self.log, "shield_grab_unconfirmed",
+              detail="shield input grab not confirmed; escalating to OS lock (fail-closed)")
+        self.audit.append("shield_grab_unconfirmed")
+        # Invalidate any grant minted for this ungrabbed shield and engage the
+        # real OS lock; keep the monitor lit for the password prompt.
+        self.grant.force_locked()
+        self._escalate_os_lock("shield_grab_failed")
+        self._enqueue_shield("screen_on")
 
     # -- lock actuation --------------------------------------------------- #
     def _escalate_os_lock(self, reason: str) -> bool:
@@ -388,6 +554,7 @@ class Guardian:
             "watchdog_tripped": self._watchdog_tripped,
             "os_locked": self.lock_ctl.is_any_locked(),
             "audit_enabled": self.audit.enabled,
+            "dry_run": self._dry_run,
             "perception_paused": self._perception_paused,
             "pause_resume_in_s": (round(self._resume_at - time.monotonic(), 1)
                                   if (self._perception_paused and self._resume_at is not None)
@@ -480,22 +647,27 @@ class Guardian:
         # actually visible (while locked-and-away the screen is DPMS-off). When
         # they leave, blank it again. This is what makes the graphics show.
         now = time.monotonic()
+        # DPMS side note: instead of enqueuing a screen_on/screen_off per frame
+        # (which strobed the monitor under a camera flap), record the DESIRED
+        # DPMS state; _drain_shield_queue reconciles it once per tick with the
+        # last-state de-dupe. This debounces the perception-driven monitor power
+        # while leaving the visual feedback (checking/denied/status) per-frame.
         if phase == "recognizing":  # CHECKING AUTHORIZATION (with a real progress bar)
             if now < self._denied_until:
                 return {"ok": True, "held": "denied"}  # let the verdict linger
             progress = float(message.get("progress") or 0.0)
             votes_k = int(message.get("votes_k") or 0)
             votes_need = int(message.get("votes_need") or 0)
-            self._enqueue_shield("screen_on")
+            self._dpms_desired = True  # someone is present -> wake (debounced)
             self._enqueue_shield("checking", (progress, votes_k, votes_need))
         elif phase == "denied":  # UNAUTHORIZED verdict
             self._denied_until = now + self._denied_hold_s
-            self._enqueue_shield("screen_on")
+            self._dpms_desired = True  # show the verdict -> wake (debounced)
             self._enqueue_shield("denied", "Unauthorized user")
         elif phase == "locked":
             reason = str(message.get("reason") or "away")
             self._enqueue_shield("status", _status_for(reason))
-            self._enqueue_shield("screen_off")  # nobody present -> dark again
+            self._dpms_desired = False  # nobody present -> dark again (debounced)
         else:
             return {"ok": False, "reason": "bad_phase", "phase": phase}
         return {"ok": True}
@@ -533,6 +705,7 @@ class Guardian:
             "daemon_state": self._daemon_state,
             "last_heartbeat_age_s": round(time.monotonic() - self._last_heartbeat, 2),
             "watchdog_tripped": self._watchdog_tripped,
+            "dry_run": self._dry_run,
         }
         try:
             _paths.secure_write_bytes(
@@ -564,8 +737,12 @@ class Guardian:
         except OSError as exc:
             event(self.log, "control_server_failed", error=str(exc))
             return 1
+        # Loud CRITICAL declaration BEFORE announcing readiness: a dry-run boot
+        # must never be silent (DES-DRYRUN section 4.1.2).
+        if self._dry_run:
+            emit_dry_run_banner(self.log, "guardian")
         event(self.log, "guardian_started", socket=str(self._server.socket_path),
-              shield=self.shield_enabled, phase=self.cfg.phase)
+              shield=self.shield_enabled, phase=self.cfg.phase, dry_run=self._dry_run)
         _sd_notify("READY=1")
 
         last_health = 0.0
@@ -585,14 +762,9 @@ class Guardian:
                     event(self.log, "perception_auto_resumed")
                 # Re-assert monitor-off while locked (X wakes the display on its
                 # own timers). This is display-only; perception keeps running in
-                # facelockd, so the owner's return is still detected.
-                if (self._screen_off_active
-                        and (now - self._last_screen_assert) >= self._screen_reassert_s):
-                    try:
-                        self.display.screen_off()
-                    except Exception as exc:
-                        event(self.log, "display_error", op="reassert", error=str(exc))
-                    self._last_screen_assert = now
+                # facelockd, so the owner's return is still detected. Runs on a
+                # SLOW cadence (see _maybe_reassert_screen) to avoid the xset storm.
+                self._maybe_reassert_screen(now)
                 if now - last_health >= 2.0:
                     self._write_health()
                     _sd_notify("WATCHDOG=1")
@@ -646,6 +818,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="facelock-guardian",
                                      description="facelock session guardian (lock authority)")
     parser.add_argument("--config", type=Path, default=None, help="path to config.toml")
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="SAFE test mode: log OS-lock escalations but NEVER actuate the OS lock "
+             "(no loginctl/gdbus/xdg -- your screen will not lock)")
     args = parser.parse_args(argv)
     try:
         cfg = load_config(args.config).resolve_model_paths(_paths.models_dir())
@@ -654,7 +830,14 @@ def main(argv: list[str] | None = None) -> int:
         for err in getattr(exc, "errors", []) or []:
             print(f"  - {err}", file=sys.stderr)
         return 2
-    return Guardian(cfg).run()
+    try:
+        dry_run = resolve_dry_run(args.dry_run, cfg)
+    except DryRunUnderSystemdError as exc:
+        # systemd hard-gate: config-only dry-run under a managed service is
+        # fail-closed refused (exit 2, matching the config-refusal contract).
+        print(f"facelock-guardian: {exc}", file=sys.stderr)
+        return 2
+    return Guardian(cfg, dry_run=dry_run).run()
 
 
 if __name__ == "__main__":  # pragma: no cover

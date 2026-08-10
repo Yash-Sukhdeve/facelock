@@ -251,3 +251,48 @@ class LockController:
             self.logger.info({"event": event, **fields})
         except Exception:
             pass
+
+
+class DryRunLockController:
+    """SAFE no-op OS-lock controller for dry-run mode (DES-DRYRUN, design 3.1).
+
+    Duck-types the two methods the guardian uses on a :class:`LockController`
+    (``engage()`` and ``is_any_locked()``) but NEVER actuates the OS lock: it
+    builds no backend and NEVER calls :func:`_run` (the sole loginctl/gdbus/xdg
+    subprocess site). Every escalation runs its full decision path and is logged
+    as a "would-have", so the guardian can be exercised end-to-end with zero
+    chance of locking the real screen.
+
+    ``engage()`` returns ``engaged=True`` on purpose: the guardian's
+    ``_escalate_os_lock`` treats ``engaged=False`` as "no backend confirmed ->
+    critical hold" -- reporting ``True`` keeps the honest "escalated (would-have)"
+    log and avoids a spurious ``lock_critical`` alarm, while ``confirmed=False``
+    stays truthful (nothing was really actuated). ``is_any_locked()`` returns
+    ``None`` (unknown), matching ``FakeController``.
+    """
+
+    def __init__(self, *, logger: Any = None) -> None:
+        self.logger = logger
+        self.engage_calls = 0
+
+    def engage(self) -> LockOutcome:
+        self.engage_calls += 1
+        # Unambiguous decision-log marker that an escalation was intercepted.
+        self._log("dry_run_would_lock", backend="dry-run")
+        return LockOutcome(
+            engaged=True,
+            confirmed=False,
+            backend="dry-run",
+            detail="dry-run: WOULD engage OS lock -- no actuation",
+        )
+
+    def is_any_locked(self) -> bool | None:
+        return None
+
+    def _log(self, event: str, **fields: Any) -> None:
+        if self.logger is None:
+            return
+        try:
+            self.logger.info({"event": event, **fields})
+        except Exception:
+            pass
