@@ -90,6 +90,8 @@ def cmd_enroll(args: argparse.Namespace) -> int:
         gui=not args.no_gui,
         settle_s=args.settle_seconds,
         capture_interval_s=args.interval_seconds,
+        screen=args.screen,
+        windowed=args.windowed,
     )
 
 
@@ -302,6 +304,11 @@ def build_parser() -> argparse.ArgumentParser:
                           help="legacy single-position capture (no guided multi-pose)")
     p_enroll.add_argument("--no-gui", action="store_true",
                           help="disable the graphical preview (text prompts only)")
+    p_enroll.add_argument("--screen", type=int, default=0,
+                          help="monitor index for the fullscreen preview "
+                               "(0-based; see 'xrandr --listmonitors', default 0)")
+    p_enroll.add_argument("--windowed", action="store_true",
+                          help="show the preview in a window instead of fullscreen")
     p_enroll.add_argument("--settle-seconds", type=float, default=2.5,
                           help="get-ready countdown before each pose (default 2.5)")
     p_enroll.add_argument("--interval-seconds", type=float, default=0.7,

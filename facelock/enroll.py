@@ -12,16 +12,19 @@ non-image sample metadata enter the template.
 from __future__ import annotations
 
 import math
+import re
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 
 from . import paths as _paths
 from .calibrate import calibrate, centroid_of
 from .config import Config
+from .enroll_ui import letterbox
 from .errors import CalibrationError, CameraError, ModelError
 from .logging_setup import event, get_logger
 from .store import (
@@ -56,6 +59,91 @@ POSES: tuple[tuple[str, str], ...] = (
     ("up", "Lift your chin UP slightly"),
     ("down", "Lower your chin DOWN slightly"),
 )
+
+
+# Enrollment capture resolution/format. Independent of the daemon's runtime
+# camera config (which stays at its low-power YUYV/640x480): a 720p MJPG grab
+# gives a crisp face in the circle for a better template crop. SFace aligns to
+# 112x112 internally, so a higher source res only sharpens the aligned crop and
+# never changes the pipeline. We do NOT touch cfg.camera here.
+ENROLL_CAM_W = 1280
+ENROLL_CAM_H = 720
+ENROLL_CAM_FMT = "MJPG"
+
+
+class Monitor(NamedTuple):
+    """One connected display: name + pixel geometry (w, h) at offset (x, y)."""
+
+    name: str
+    w: int
+    h: int
+    x: int
+    y: int
+
+
+# Safe fallback when xrandr is missing / unparseable (headless X, minimal WM):
+# a single 1080p monitor at the origin. Enrollment then fullscreens on :0 @ 0,0.
+FALLBACK_MONITOR = Monitor(name="default", w=1920, h=1080, x=0, y=0)
+
+# `xrandr --listmonitors` line, e.g.
+#   " 0: +*eDP-1 1920/344x1080/193+0+0  eDP-1"
+# and the mm-less variant " 0: +*DP-1 3440x1440+0+0  DP-1".
+_MON_LINE = re.compile(r"^\s*(\d+):\s+(\S+)\s+(\S+)")
+_MON_GEOM = re.compile(
+    r"^(\d+)(?:/\d+)?x(\d+)(?:/\d+)?\+(-?\d+)\+(-?\d+)$"
+)
+
+
+def parse_xrandr_monitors(text: str) -> list[Monitor]:
+    """Parse ``xrandr --listmonitors`` output into a list of :class:`Monitor`.
+
+    Pure + robust: ignores the ``Monitors: N`` header and any line that is not a
+    well-formed monitor row, so garbage yields ``[]`` (the caller then falls back
+    to :data:`FALLBACK_MONITOR`). Never raises.
+    """
+    monitors: list[Monitor] = []
+    for line in (text or "").splitlines():
+        m = _MON_LINE.match(line)
+        if not m:
+            continue
+        g = _MON_GEOM.match(m.group(3))
+        if not g:
+            continue
+        name = m.group(2).lstrip("+*")
+        w, h, x, y = (int(v) for v in g.groups())
+        monitors.append(Monitor(name=name, w=w, h=h, x=x, y=y))
+    return monitors
+
+
+def list_monitors() -> list[Monitor]:
+    """Enumerate connected monitors via ``xrandr --listmonitors``.
+
+    Falls back to ``[FALLBACK_MONITOR]`` when xrandr is absent, times out, exits
+    non-zero, or emits nothing parseable. Never raises (fail-safe for the picker).
+    """
+    try:
+        proc = subprocess.run(
+            ["xrandr", "--listmonitors"],
+            capture_output=True, text=True, timeout=3.0,
+        )
+    except Exception:
+        return [FALLBACK_MONITOR]
+    if proc.returncode != 0:
+        return [FALLBACK_MONITOR]
+    monitors = parse_xrandr_monitors(proc.stdout)
+    return monitors or [FALLBACK_MONITOR]
+
+
+def pick_monitor(monitors: list[Monitor], index: int) -> Monitor:
+    """Return ``monitors[index]`` with the index clamped into range.
+
+    An empty list yields :data:`FALLBACK_MONITOR` (never an ``IndexError``), so a
+    bad ``--screen N`` can never crash enrollment.
+    """
+    if not monitors:
+        return FALLBACK_MONITOR
+    i = max(0, min(int(index), len(monitors) - 1))
+    return monitors[i]
 
 
 def pose_plan(
@@ -184,8 +272,15 @@ class EnrollmentTool:
         settle_s: float = 2.5,
         capture_interval_s: float = 0.7,
         timeout_s: float = 240.0,
+        screen: int = 0,
+        windowed: bool = False,
     ) -> int:
-        """Run the guided enrollment flow. Returns a process exit code."""
+        """Run the guided enrollment flow. Returns a process exit code.
+
+        ``screen`` selects the monitor (0-based) for the fullscreen preview and
+        ``windowed`` shows it in a movable window instead. The preview renders at
+        the chosen display's native resolution (1:1, no fullscreen upscaling).
+        """
         from .capture import CameraCapture
         from .detect import FaceDetector
         from .embed import FaceEmbedder
@@ -220,11 +315,14 @@ class EnrollmentTool:
 
         print(f"Enrolling '{name}'. A scan window will open: keep your face in the "
               "circle and slowly move your head to fill the ring.")
+        # Grab at 720p MJPG for a crisp face in the circle. This is an
+        # enrollment-only override -- the daemon's low-power runtime config
+        # (cfg.camera) is left untouched.
         camera = CameraCapture(
             self.cfg.camera.device,
-            width=self.cfg.camera.resolution[0],
-            height=self.cfg.camera.resolution[1],
-            pixel_format=self.cfg.camera.pixel_format,
+            width=ENROLL_CAM_W,
+            height=ENROLL_CAM_H,
+            pixel_format=ENROLL_CAM_FMT,
             fps=self.cfg.camera.fps_active,
         )
         # Free the camera -- auto-pause a running facelock daemon if it holds it,
@@ -260,9 +358,18 @@ class EnrollmentTool:
         flash = 0.0
         tick = 0
         wname = "facelock enrollment"
-        gui = self._init_preview(cv2, gui and has_display(), wname)
+        monitors = list_monitors()
+        gui, disp_w, disp_h = self._init_preview(
+            cv2, gui and has_display(), wname,
+            monitors=monitors, screen=screen, windowed=windowed)
         if not gui:
             print(f"(no GUI) {instruction} -- capturing {target_new} samples...")
+
+        def _fit(frame_bgr: Any) -> Any:
+            """Scale the camera frame up to the display resolution before the HUD
+            is drawn, so the fullscreen output is 1:1 with the monitor (the ring
+            and text are never upscaled). ``render`` returns a same-size image."""
+            return letterbox(frame_bgr, disp_w, disp_h)
 
         def _done() -> bool:
             if multipose:
@@ -283,7 +390,7 @@ class EnrollmentTool:
                     view = RingView(owner=name, captured=base_n, target=target_total,
                                     n_segments=N_SEG, instruction="Get ready...",
                                     status=str(int(math.ceil(left))), tick=tick)
-                    if self._show(cv2, wname, render(frame.bgr, view)) == 27:
+                    if self._show(cv2, wname, render(_fit(frame.bgr), view)) == 27:
                         print("\nenroll: cancelled by user.")
                         return 1
 
@@ -364,7 +471,7 @@ class EnrollmentTool:
                         instruction=instruction, status=status, phase="capture",
                         bbox=bbox, quality_ok=q.ok,
                         reject=(None if q.ok else q.reason), flash=flash, tick=tick)
-                    if self._show(cv2, wname, render(frame.bgr, view)) == 27:
+                    if self._show(cv2, wname, render(_fit(frame.bgr), view)) == 27:
                         print("\nenroll: cancelled by user.")
                         return 1
                 else:
@@ -381,7 +488,7 @@ class EnrollmentTool:
                         current=None, target_segment=None, frontal_done=True,
                         instruction="Enrollment complete", status="All set!",
                         phase="done", tick=tick)
-                    self._show(cv2, wname, render(frame.bgr, view))
+                    self._show(cv2, wname, render(_fit(frame.bgr), view))
                     cv2.waitKey(1000)
 
             if len(accepted_emb) < 2:
@@ -429,20 +536,48 @@ class EnrollmentTool:
                 self._resume_daemon()
 
     # -- enrollment preview window (futuristic HUD) ----------------------- #
-    def _init_preview(self, cv2: Any, want: bool, wname: str) -> bool:
-        """Create the preview window; return False (fall back to text) on failure.
+    def _init_preview(
+        self,
+        cv2: Any,
+        want: bool,
+        wname: str,
+        *,
+        monitors: list[Monitor] | None = None,
+        screen: int = 0,
+        windowed: bool = False,
+    ) -> tuple[bool, int, int]:
+        """Create the preview window on the chosen monitor.
 
-        A headless / no-highgui OpenCV build raises here; enrollment then runs
-        with terminal prompts only (never crashes).
+        Returns ``(gui_ok, render_w, render_h)`` -- the render size is the
+        display's native resolution so the caller can scale the camera frame to
+        it (1:1 fullscreen, no upscaling). A headless / no-highgui OpenCV build
+        raises here; enrollment then runs with terminal prompts only, returning
+        ``(False, 0, 0)`` and never crashing.
         """
         if not want:
-            return False
+            return False, 0, 0
+        mon = pick_monitor(monitors if monitors else [FALLBACK_MONITOR], screen)
         try:
             cv2.namedWindow(wname, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(wname, 960, 720)
-            return True
+            if windowed:
+                # Movable window on the chosen monitor; render at a lighter size
+                # (still 1:1 with the window, so the HUD stays crisp).
+                w = min(int(mon.w), 1280)
+                h = min(int(mon.h), 720)
+                cv2.resizeWindow(wname, w, h)
+                cv2.moveWindow(wname, int(mon.x) + 40, int(mon.y) + 40)
+                return True, w, h
+            # Fullscreen on the chosen monitor. Place -> flip fullscreen ->
+            # re-place: some WMs recenter the window when the property changes
+            # (mirrors the vetted capture_pro placement sequence).
+            cv2.moveWindow(wname, int(mon.x), int(mon.y))
+            cv2.resizeWindow(wname, int(mon.w), int(mon.h))
+            cv2.setWindowProperty(wname, cv2.WND_PROP_FULLSCREEN,
+                                  cv2.WINDOW_FULLSCREEN)
+            cv2.moveWindow(wname, int(mon.x), int(mon.y))
+            return True, int(mon.w), int(mon.h)
         except Exception:
-            return False
+            return False, 0, 0
 
     def _show(self, cv2: Any, wname: str, img: Any) -> int:
         """imshow + pump events; returns the pressed key (or -1). Never raises."""

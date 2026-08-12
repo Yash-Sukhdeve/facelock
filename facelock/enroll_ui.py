@@ -268,6 +268,37 @@ def _draw_texts(cv2, np, canvas_u8, items):
 
 
 # --------------------------------------------------------------------------- #
+# Resolution fitting: scale a camera frame up to the *display's* resolution
+# BEFORE rendering, so the fullscreen HUD is 1:1 with the monitor (no upscaling
+# of the text/ring). Aspect is preserved (letterboxed) so the face keeps its true
+# proportions; ``render`` then center-crops the fitted frame into the face disc.
+# --------------------------------------------------------------------------- #
+def letterbox(frame_bgr, target_w: int, target_h: int):
+    """Return ``frame_bgr`` resized to exactly ``target_w x target_h``, aspect
+    preserved with centered black padding. Pure + headless-testable; never
+    mutates the input and never raises on a degenerate (empty) frame.
+    """
+    import cv2
+    import numpy as np
+
+    tw = max(1, int(target_w))
+    th = max(1, int(target_h))
+    src = np.ascontiguousarray(frame_bgr)
+    out = np.zeros((th, tw, 3), np.uint8)
+    if src.ndim != 3 or src.shape[0] <= 0 or src.shape[1] <= 0 or src.size == 0:
+        return out
+    h, w = src.shape[:2]
+    scale = min(tw / w, th / h)
+    nw = max(1, int(round(w * scale)))
+    nh = max(1, int(round(h * scale)))
+    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+    resized = cv2.resize(src, (nw, nh), interpolation=interp)
+    ox, oy = (tw - nw) // 2, (th - nh) // 2
+    out[oy:oy + nh, ox:ox + nw] = resized
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # The renderer.
 # --------------------------------------------------------------------------- #
 def _lerp(a, b, t):
