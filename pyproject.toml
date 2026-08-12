@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "facelock"
-version = "0.1.0"
-description = "Screensaver-only face-unlock prototype (fail-closed, CPU-only, local)"
+version = "0.2.0"
+description = "Screensaver-class local face-unlock (fail-closed, CPU-only, RGB, no PAM)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -56,6 +56,14 @@ include = ["facelock*"]
 # premium enrollment UI has crisp typography on a bare machine (design G1).
 [tool.setuptools.package-data]
 facelock = ["assets/fonts/*.otf", "assets/fonts/*.txt"]
+
+# Ship the default config + the systemd --user units in the wheel so a bare
+# `pipx install facelock` gives `facelock setup` the files it needs. They land
+# under <sys.prefix>/config and <sys.prefix>/systemd on install; setup_cmd
+# resolves them there (or from the repo root in a source checkout).
+[tool.setuptools.data-files]
+"config" = ["config/facelock.toml"]
+"systemd" = ["systemd/facelockd.service", "systemd/facelock-guardian.service"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -32,7 +32,17 @@ __all__ = [
     "PROTOTYPE_SPOOF_DISCLOSURE",
 ]
 
-__version__ = "0.1.0"
+# Single source of truth for the version is pyproject.toml. At runtime we read
+# it back from the installed package metadata; the literal below is only a
+# fallback for running straight from a source tree with no install, and is kept
+# equal to the pyproject version.
+try:
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _pkg_version
+
+    __version__ = _pkg_version("facelock")
+except PackageNotFoundError:  # pragma: no cover - source tree without install
+    __version__ = "0.2.0"
 
 # REQ-F-17 / AC-F-17: the exact disclosure shown on first run and in the README.
 PROTOTYPE_SPOOF_DISCLOSURE = (

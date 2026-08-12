@@ -1,0 +1,74 @@
+name: Release
+
+# Cut a release by pushing a version tag, e.g.:  git tag v0.2.0 && git push --tags
+# This builds the wheel + sdist, runs the full test suite as a gate, publishes a
+# GitHub Release with the artifacts attached, and (only if a PyPI token secret is
+# configured) publishes to PyPI. If the token is absent the PyPI step is skipped
+# gracefully -- the GitHub Release still happens.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # required to create the GitHub Release and upload assets
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      # Whether a PyPI token is configured. Referencing a secret via a job-level
+      # env is the documented way to guard a step's `if:` on secret presence.
+      HAVE_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # System libs OpenCV + the Tk shield need so the (headless) test suite runs.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk libgl1 libglib2.0-0
+
+      - name: Install build + test tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build
+          python -m pip install -e .
+          python -m pip install pytest
+
+      # Gate the release on a green suite: a failing step stops the job, so a
+      # broken build is never published.
+      - name: Run tests
+        run: pytest -q
+
+      - name: Build wheel + sdist
+        run: python -m build
+
+      - name: Create GitHub Release with artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Publish to PyPI only when a token is configured. Uses the official
+      # publisher action; token via the `password` input.
+      - name: Publish to PyPI
+        if: env.HAVE_PYPI_TOKEN == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+
+      - name: PyPI publish skipped (no token configured)
+        if: env.HAVE_PYPI_TOKEN != 'true'
+        run: |
+          echo "PYPI_API_TOKEN secret is not set -- skipping the PyPI publish step."
+          echo "The GitHub Release with the wheel + sdist was still created."

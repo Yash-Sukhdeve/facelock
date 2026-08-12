@@ -44,10 +44,22 @@ def _code_lines(path: str):
             yield i, s
 
 
-def _scan(predicate) -> list[str]:
+# The one-shot provisioning verb (`facelock setup`) is the ONLY module allowed
+# to fetch over the network -- it downloads the SHA-256-pinned public models from
+# the OpenCV Zoo, exactly as scripts/download_models.sh already does. It is not
+# part of the running unlock service and never touches biometric data. REQ-NF-12
+# ("no outbound network") governs the RUNTIME unlock path; a separate test below
+# proves that path can never import the provisioning module.
+_PROVISIONING_EXEMPT = {"setup_cmd.py"}
+
+
+def _scan(predicate, exclude: set[str] | None = None) -> list[str]:
+    exclude = exclude or set()
     hits = []
     for path in _py_files():
         rel = os.path.relpath(path, PKG_DIR)
+        if os.path.basename(path) in exclude:
+            continue
         for lineno, line in _code_lines(path):
             if predicate(line):
                 hits.append(f"{rel}:{lineno}: {line}")
@@ -62,11 +74,42 @@ def test_no_pam_import_anywhere():
 
 # --- REQ-NF-12: local-only, no outbound network ----------------------------- #
 def test_no_network_client_imports():
+    # The RUNTIME unlock path (everything except the one-shot provisioning verb)
+    # must have zero network clients. `setup_cmd.py` is exempt because it is the
+    # model-provisioning tool (SHA-pinned downloads from the OpenCV Zoo); the
+    # compensating control below proves it can never enter the unlock loop.
     forbidden = ("import requests", "from requests", "import urllib", "from urllib",
                  "import http.client", "from http.client", "import httpx", "from httpx",
                  "import aiohttp", "urllib.request", "urlopen(")
-    hits = _scan(lambda s: any(tok in s for tok in forbidden))
+    hits = _scan(lambda s: any(tok in s for tok in forbidden),
+                 exclude=_PROVISIONING_EXEMPT)
     assert not hits, "REQ-NF-12 violated -- network client usage found:\n" + "\n".join(hits)
+
+
+def test_setup_network_capability_confined_to_provisioning():
+    """Compensating control for the setup_cmd network exemption (REQ-NF-12).
+
+    The provisioning module may fetch models, but the running unlock service
+    must never gain that capability. Assert that no runtime module -- the
+    perception daemon, the session guardian, or any module they transitively
+    rely on for the unlock loop -- imports ``setup_cmd``. Only the CLI's
+    ``setup`` verb (a user-invoked, one-shot command) is permitted to.
+    """
+    runtime_modules = (
+        "daemon.py", "guardian.py", "control.py", "matcher.py", "store.py",
+        "capture.py", "detect.py", "embed.py", "fsm.py", "shield.py",
+        "lock_backend.py", "liveness.py",
+    )
+    hits = []
+    for path in _py_files():
+        base = os.path.basename(path)
+        if base not in runtime_modules:
+            continue
+        for lineno, line in _code_lines(path):
+            if "setup_cmd" in line:
+                hits.append(f"{base}:{lineno}: {line}")
+    assert not hits, ("REQ-NF-12 -- network-capable provisioning module leaked into "
+                      "the runtime unlock path:\n" + "\n".join(hits))
 
 
 def test_no_inet_sockets_only_unix():

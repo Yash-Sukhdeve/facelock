@@ -200,6 +200,25 @@ def cmd_config_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_setup(args: argparse.Namespace) -> int:
+    """Provision models (SHA-pinned) + config (+ optional systemd units).
+
+    Fresh-machine step between install and enroll. Fail-closed on a model hash
+    mismatch. Never enables auto-start (enroll first). See ``setup_cmd``.
+    """
+    from . import setup_cmd
+
+    try:
+        setup_cmd.run_setup(systemd=bool(args.systemd))
+    except setup_cmd.SetupError as exc:
+        print(f"setup failed: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"setup failed: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
 def cmd_test(args: argparse.Namespace) -> int:
     """Camera + pipeline self-test: fps, per-frame latency, score vs tau."""
     try:
@@ -294,6 +313,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"facelock {__version__}")
     parser.add_argument("--config", type=Path, default=None, help="path to config.toml")
     sub = parser.add_subparsers(dest="verb", required=True)
+
+    p_setup = sub.add_parser(
+        "setup", help="download SHA-pinned models + install config (run once after install)")
+    p_setup.add_argument("--systemd", action="store_true",
+                         help="also install the --user systemd units (does NOT enable auto-start)")
+    p_setup.set_defaults(func=cmd_setup)
 
     p_enroll = sub.add_parser("enroll", help="enroll or re-enroll the owner face")
     p_enroll.add_argument("--name", default="Yash", help="owner display name (greeting)")

@@ -55,46 +55,73 @@ to the real OS lock.
 
 ---
 
-## Install (one command, user-space)
+## What this is (honest scope — read before installing)
+
+facelock is a **screensaver-class**, **local** face-unlock for a single Linux
+workstation: an **RGB** webcam, **CPU-only**, with **no PAM** integration. It
+controls only the screensaver/shield of an already-logged-in session — your OS
+password lock is never removed or weakened. **Anti-spoofing is OFF by default**,
+so this build is documentedly bypassable by a printed photo or a phone/monitor
+video of the owner (the same limitation Howdy documents). It is a convenience
+layer, **not** a certified biometric.
+
+## Install (pipx — recommended)
 
 ```bash
-# install the system prerequisites first (see below), then:
-git clone https://github.com/Yash-Sukhdeve/facelock
-cd facelock
-./scripts/install.sh
+pipx install facelock     # or: ./scripts/install-pipx.sh
+facelock setup            # downloads the SHA-pinned models + installs the config
+facelock enroll --name <YourName>
 ```
 
-This creates an isolated venv, installs pinned deps + the `facelock` package,
-links `facelock` / `facelockd` / `facelock-guardian` into `~/.local/bin`,
-installs the config at `~/.config/facelock/config.toml` (0600), **downloads the
-SHA-pinned models**, and installs the `systemd --user` units. When run
-interactively it then **offers to enroll your face and enable** face-unlock —
-and it will **not** enable auto-start until a face is enrolled (otherwise the
-next login would lock the screen with no enrolled face able to clear it).
+`facelock setup` fetches the **SHA-256-pinned** YuNet + SFace models from the
+OpenCV Zoo into `~/.local/share/facelock/models` (verifying each hash and
+refusing on a mismatch — fail-closed), and installs the default config at
+`~/.config/facelock/config.toml` (0600) if you don't already have one. It is
+idempotent and never enables auto-start. Add `--systemd` to also install the
+`--user` service units (still not enabled — you enroll first).
 
-Prerequisites (system packages, not pip):
+System prerequisite (a system package, not pip — needed for the Tk shield):
 
 ```bash
-sudo apt-get install python3-venv python3-tk   # tkinter is needed for the shield
+sudo apt-get install python3-tk
 ```
 
-Manual install (equivalent):
+If you don't have `pipx`, `scripts/install-pipx.sh` installs it for you (or:
+`python3 -m pip install --user pipx && pipx ensurepath`).
+
+### Install from a GitHub Release (no PyPI)
+
+Download the wheel from the [Releases page](https://github.com/Yash-Sukhdeve/facelock/releases),
+then:
 
 ```bash
-python3 -m venv ~/.local/share/facelock/venv
-~/.local/share/facelock/venv/bin/pip install -r requirements.txt
-~/.local/share/facelock/venv/bin/pip install .
+pipx install ./facelock-0.2.0-py3-none-any.whl
+facelock setup
+facelock enroll --name <YourName>
 ```
 
-## (a) Download the models
-
-Done automatically by `install.sh`; to run it by itself:
+### Alternative: from source (`install.sh`)
 
 ```bash
-./scripts/download_models.sh
-# fetches YuNet + SFace from the OpenCV Zoo into ~/.local/share/facelock/models,
-# records SHA-256s in scripts/models.sha256 (verify then keep them pinned — R6).
+git clone https://github.com/Yash-Sukhdeve/facelock && cd facelock
+./scripts/install.sh      # venv + pinned deps + config + models + systemd units
 ```
+
+`install.sh` creates an isolated venv, installs pinned deps + the package, wires
+the console scripts into `~/.local/bin`, downloads the SHA-pinned models, and
+installs the `systemd --user` units — and when run interactively it offers to
+enroll and enable, but **never** enables auto-start before a face is enrolled.
+The models can also be fetched on their own with `./scripts/download_models.sh`.
+
+## Recognition model metrics (scoped, not a biometric-grade claim)
+
+The recognition **backbone** (SFace + the deployed matcher) separates the owner
+from LFW strangers with **sub-percent equal-error** at the shipped threshold.
+These are **model** score-separability metrics on captured embeddings — **not**
+a certified biometric, not an application-level deployment FMR/FNMR, and not a
+spoof-resistance claim. Read the full scope box and numbers in
+[`docs/MODEL_METRICS.md`](docs/MODEL_METRICS.md). No "biometric-grade" product
+claim is made.
 
 ## (b) Enroll your face
 
@@ -223,7 +250,7 @@ REQ-NF-21/26 pinned deps + reproducible build.
 Hardware-independent unit tests (no camera, no daemon, no display):
 
 ```bash
-python3 -m pytest        # 114 tests
+python3 -m pytest        # 408 tests, offline (no camera, daemon, or display)
 ```
 
 They cover matcher math, k-of-n voting, τ calibration + floor, config
