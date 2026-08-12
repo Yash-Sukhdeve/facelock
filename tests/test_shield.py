@@ -62,3 +62,12 @@ def test_render_is_safe_without_canvas():
     s = ShieldWindow()
     s._render()
     assert s._canvas is None
+
+
+def test_default_owner_name_is_neutral_not_a_persons_name():
+    # Pre-publish fix: the constructor fallback must not be the author's name
+    # ("Yash") -- guardian.py always passes config.unlock.owner_name explicitly,
+    # but any direct ShieldWindow() construction must still get a neutral name.
+    s = ShieldWindow()
+    assert s.owner_name == "User"
+    assert s.owner_name != "Yash"

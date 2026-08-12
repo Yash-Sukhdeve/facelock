@@ -136,6 +136,10 @@ def test_pillow_confined_to_ui_and_never_persists():
                        + "\n".join(stray))
 
     # PIL's image-persistence idiom is Image.save(...); it must be absent.
-    persist = _scan(lambda s: "Image.save(" in s or ".save(" in s and "PIL" in s)
+    # (tightened: the original `A in s or B in s and C in s` parsed as
+    # `A or (B and C)`, which is the intended precedence here but read as an
+    # accident -- made explicit so intent is unambiguous at a glance.)
+    persist = _scan(lambda s: ("Image.save(" in s)
+                     or (".save(" in s and ("PIL" in s or "Image" in s)))
     assert not persist, ("REQ-NF-13 concern -- PIL image persistence found:\n"
                          + "\n".join(persist))

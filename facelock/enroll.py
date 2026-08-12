@@ -23,7 +23,7 @@ import numpy as np
 
 from . import paths as _paths
 from .calibrate import calibrate, centroid_of
-from .config import Config
+from .config import Config, update_owner_name
 from .enroll_ui import letterbox
 from .errors import CalibrationError, CameraError, ModelError
 from .logging_setup import event, get_logger
@@ -515,6 +515,7 @@ class EnrollmentTool:
                 return 1
 
             store.save(template)
+            self._persist_owner_name(name)
             calib = template.calibration
             event(self.log, "enroll", owner=name, samples=len(accepted_emb),
                   tau=round(template.tau, 4), meets_target=calib.get("meets_target"))
@@ -534,6 +535,29 @@ class EnrollmentTool:
             camera.release()
             if paused_by_us:
                 self._resume_daemon()
+
+    def _persist_owner_name(self, name: str) -> None:
+        """Write ``enroll --name <name>`` into ``config.toml`` so the runtime
+        greeting matches the enrolled owner (REQ-F-15) -- called only AFTER
+        the template is safely on disk.
+
+        Fail-safe by design: this NEVER aborts an already-successful
+        enrollment. ``update_owner_name`` itself never raises, but this is
+        wrapped defensively anyway (belt-and-suspenders) so a monkeypatched
+        or future replacement that *does* raise still can't void the
+        enrollment -- only a warning is printed.
+        """
+        cfg_path = self.cfg.source_path
+        if cfg_path is None:
+            print("  config note: config source unknown (loaded from raw data); "
+                  "owner_name not persisted to disk.")
+            return
+        try:
+            ok, msg = update_owner_name(cfg_path, name)
+        except Exception as exc:  # config-write hiccup must never void a good enrollment
+            print(f"  config note: could not persist owner_name to config: {exc}")
+            return
+        print(f"  config: {msg}" if ok else f"  config note: {msg}")
 
     # -- enrollment preview window (futuristic HUD) ----------------------- #
     def _init_preview(

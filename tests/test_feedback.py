@@ -245,8 +245,8 @@ def test_unlock_shows_welcome_splash_then_dismisses_after_hold():
     g._drain_shield_queue()
     # Both surfaces: on-shield welcome splash AND the desktop notification.
     assert g.shield.phase == "welcome"
-    assert g.shield.text == "Welcome back, Yash"
-    assert g.greeter.shown == ["Yash"]
+    assert g.shield.text == "Welcome back, User"
+    assert g.greeter.shown == ["User"]
     assert g.shield.is_up is True                  # still up during the hold
     assert g._welcome_dismiss_at is not None
     # Before the hold elapses -> still up.
@@ -269,7 +269,7 @@ def test_unlock_with_zero_hold_dismisses_immediately():
     }, UID)
     g._drain_shield_queue()
     assert g.shield.is_up is False                 # instant dismiss
-    assert g.greeter.shown == ["Yash"]             # notification still fires
+    assert g.greeter.shown == ["User"]             # notification still fires
     assert g._welcome_dismiss_at is None
 
 

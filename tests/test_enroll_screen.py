@@ -196,3 +196,13 @@ def test_cli_defaults_screen_zero_not_windowed(monkeypatch):
     assert args.func(args) == 0
     assert captured["screen"] == 0
     assert captured["windowed"] is False
+
+
+def test_cli_enroll_name_default_is_neutral_not_a_persons_name(monkeypatch):
+    # Pre-publish fix: a user who runs `facelock enroll` with no --name must not
+    # be enrolled/greeted under the author's name ("Yash").
+    cli, captured = _spy_cli(monkeypatch)
+    args = cli.build_parser().parse_args(["enroll"])
+    assert args.func(args) == 0
+    assert captured["name"] == "User"
+    assert captured["name"] != "Yash"

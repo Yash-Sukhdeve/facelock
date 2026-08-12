@@ -321,7 +321,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_setup.set_defaults(func=cmd_setup)
 
     p_enroll = sub.add_parser("enroll", help="enroll or re-enroll the owner face")
-    p_enroll.add_argument("--name", default="Yash", help="owner display name (greeting)")
+    p_enroll.add_argument("--name", default="User", help="owner display name (greeting)")
     p_enroll.add_argument("--augment", action="store_true", help="add to the existing template")
     p_enroll.add_argument("--samples-per-pose", type=int, default=3,
                           help="frames captured per guided head position (default 3)")
