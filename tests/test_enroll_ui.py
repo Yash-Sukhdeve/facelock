@@ -1,15 +1,21 @@
-"""Dynamic enrollment UI tests: head-pose geometry + interactive ring HUD.
+"""Dynamic enrollment UI tests: head-pose geometry + the Face-ID-style HUD.
 
-Drawing is real OpenCV on NumPy frames (testable headless -- no window opened).
-We assert the pure head-direction/segment/guidance maths and that ``render``
-draws every state without raising and preserves the frame shape/dtype.
+Drawing is real OpenCV/Pillow on NumPy frames (testable headless -- no window
+opened). We assert the pure head-direction/segment/guidance maths, and that the
+polished ``render`` draws every phase without raising, preserves the frame
+shape/dtype, never mutates the input, lights green as coverage fills, shows the
+completion state, and -- critically -- still returns a valid image when Pillow
+is unavailable (the cv2.putText fallback for a bare machine).
 """
 
 from __future__ import annotations
 
+import builtins
+
 import numpy as np
 import pytest
 
+import facelock.enroll_ui as ui
 from facelock.enroll_ui import (
     RingView,
     coverage_fraction,
@@ -88,29 +94,128 @@ def _view(**kw):
 @pytest.mark.parametrize("phase", ["capture", "done"])
 def test_render_every_phase(phase):
     img = render(_frame(), _view(phase=phase, covered=frozenset({0, 1, 2}),
-                                 current=3, target_segment=4, tick=7))
+                                 current=3, target_segment=4, tick=7,
+                                 instruction="Set Up Face Unlock",
+                                 status="Looking great", quality_ok=True))
     assert img.shape == (480, 640, 3) and img.dtype == np.uint8
-    assert int(img.sum()) > 0
+    assert int(img.sum()) > 0            # something was actually drawn
 
 
 def test_render_with_flash_and_reject_and_bbox():
     img = render(_frame(), _view(bbox=(80, 60, 200, 200), quality_ok=False,
                                  reject="too_blurry", flash=1.0, current=2,
                                  target_segment=5, status="Hold still"))
-    assert img.shape == (480, 640, 3) and int(img.sum()) > 0
+    assert img.shape == (480, 640, 3) and img.dtype == np.uint8
+    assert int(img.sum()) > 0
 
 
 def test_render_does_not_mutate_input():
     src = _frame()
-    _ = render(src, _view())
-    assert int(src.sum()) == 0     # drew on a copy
+    _ = render(src, _view(covered=frozenset({0, 1}), flash=0.5))
+    assert int(src.sum()) == 0     # drew on a fresh canvas, not the input
+
+
+def test_render_returns_new_array():
+    src = _frame()
+    out = render(src, _view())
+    assert out is not src
 
 
 def test_render_covered_ring_has_green():
-    img = render(_frame(), _view(covered=frozenset(range(16))))
-    assert int(img[:, :, 1].max()) > 150   # green channel present (BGR)
+    # A fully covered ring lights green with a glow: the green (BGR idx 1)
+    # channel must dominate -- and clearly exceed the red/blue channels there.
+    img = render(_frame(), _view(covered=frozenset(range(16)), tick=3))
+    assert int(img[:, :, 1].max()) > 150
+    assert int(img[:, :, 1].max()) > int(img[:, :, 2].max())  # greener than red
+
+
+def test_render_capture_state_not_all_green():
+    # Early in capture (nothing covered) the ring should NOT be flooded green:
+    # far fewer strong-green pixels than when fully covered.
+    def _green_pixels(cov):
+        im = render(_frame(), _view(covered=frozenset(cov), tick=1))
+        g = im[:, :, 1].astype(int)
+        return int(((g > 140) & (g > im[:, :, 2].astype(int) + 30)).sum())
+
+    assert _green_pixels(range(16)) > _green_pixels([]) + 200
+
+
+def test_render_done_state_shows_completion():
+    img = render(_frame(), _view(phase="done", covered=frozenset(range(16)),
+                                 frontal_done=True, instruction="All set",
+                                 status="Your face is enrolled", tick=12))
+    assert img.shape == (480, 640, 3) and img.dtype == np.uint8
+    # The checkmark + "enrolled" copy render in green.
+    assert int(img[:, :, 1].max()) > 150
+
+
+def test_render_no_face_bbox_none_does_not_crash():
+    img = render(_frame(), _view(bbox=None, reject="no_face", quality_ok=False,
+                                 covered=frozenset(), current=None,
+                                 target_segment=0))
+    assert img.shape == (480, 640, 3) and img.dtype == np.uint8
 
 
 def test_render_small_frame():
-    img = render(_frame(160, 120), _view(current=1, target_segment=2))
-    assert img.shape == (160, 120, 3)
+    img = render(_frame(160, 120), _view(current=1, target_segment=2,
+                                         covered=frozenset({0})))
+    assert img.shape == (160, 120, 3) and img.dtype == np.uint8
+
+
+def test_render_tiny_frame_no_crash():
+    # A degenerate frame must still return a same-size image, not raise.
+    img = render(_frame(8, 8), _view(covered=frozenset({0, 1})))
+    assert img.shape == (8, 8, 3) and img.dtype == np.uint8
+
+
+# --- typography: Inter present, and the graceful cv2 fallback -------------- #
+def test_bundled_inter_font_loads():
+    # The Inter weights we ship must be reachable via importlib.resources and
+    # decode through Pillow (proves the assets are on the package path).
+    ImageFont = pytest.importorskip("PIL.ImageFont")
+    for weight in ("regular", "medium", "semibold"):
+        font = ui._load_font(ImageFont, weight, 24)
+        assert font is not None
+
+
+def test_render_with_pillow_present_is_crisp():
+    # Sanity: with Pillow available the title text is rasterised (non-empty).
+    pytest.importorskip("PIL")
+    img = render(_frame(), _view(instruction="Set Up Face Unlock", tick=2))
+    assert img.shape == (480, 640, 3) and int(img.sum()) > 0
+
+
+def test_render_falls_back_when_pillow_absent(monkeypatch):
+    """render() MUST NOT crash if Pillow is unavailable -- it uses cv2.putText.
+
+    We block only ``import PIL`` (everything else imports normally) and confirm
+    the font stack reports absent and render still returns a valid image with
+    legible text (non-zero content in the title band).
+    """
+    ui._font_cache.clear()
+    real_import = builtins.__import__
+
+    def _no_pil(name, *args, **kwargs):
+        if name == "PIL" or name.startswith("PIL."):
+            raise ImportError("PIL disabled for this test")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _no_pil)
+
+    assert ui._pil() is None                       # the fallback branch is live
+
+    src = _frame()
+    img = render(src, _view(phase="capture", covered=frozenset({0, 1, 2}),
+                            current=3, target_segment=4, status="Looking great",
+                            quality_ok=True, instruction="Set Up Face Unlock",
+                            flash=0.5, tick=5))
+    assert img.shape == (480, 640, 3) and img.dtype == np.uint8
+    assert int(img.sum()) > 0
+    assert int(src.sum()) == 0                     # still no input mutation
+    # Hershey text drew into the top title band.
+    assert int(img[0:60, :, :].sum()) > 0
+
+    # The done phase must also survive the Pillow-absent path.
+    done = render(_frame(), _view(phase="done", covered=frozenset(range(16)),
+                                  instruction="All set", tick=12))
+    assert done.shape == (480, 640, 3) and int(done[:, :, 1].max()) > 150

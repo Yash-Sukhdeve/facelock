@@ -83,7 +83,16 @@ def test_no_raw_frame_writes():
     assert not hits, "REQ-NF-13 violated -- raw frame write found:\n" + "\n".join(hits)
 
 
-def test_pillow_image_save_absent():
-    # PIL Image.save() would also persist an image; the prototype does not use PIL.
-    hits = _scan(lambda s: s.startswith("import PIL") or s.startswith("from PIL"))
-    assert not hits, "REQ-NF-13 concern -- PIL imported (image persistence path):\n" + "\n".join(hits)
+def test_pillow_confined_to_ui_and_never_persists():
+    # Pillow is now permitted, but ONLY in the enrollment UI and ONLY for
+    # in-memory typography (the Face-ID-style HUD). It must never leak into the
+    # daemon/store/etc., and it must never persist an image to disk (REQ-NF-13).
+    pil_imports = _scan(lambda s: s.startswith("import PIL") or s.startswith("from PIL"))
+    stray = [h for h in pil_imports if not h.startswith("enroll_ui.py:")]
+    assert not stray, ("PIL imported outside the enrollment UI (typography only):\n"
+                       + "\n".join(stray))
+
+    # PIL's image-persistence idiom is Image.save(...); it must be absent.
+    persist = _scan(lambda s: "Image.save(" in s or ".save(" in s and "PIL" in s)
+    assert not persist, ("REQ-NF-13 concern -- PIL image persistence found:\n"
+                         + "\n".join(persist))

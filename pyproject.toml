@@ -23,9 +23,13 @@ classifiers = [
 
 # Pinned to the verified target platform (REQ-NF-21/26). tomllib is stdlib.
 # numpy 2.x is required by the opencv-python 4.12 pip wheel (see requirements.txt).
+# Pillow renders the bundled Inter typeface in the enrollment UI; render() falls
+# back to cv2.putText (Hershey) if Pillow/fonts are unavailable, so it is a soft
+# runtime need -- kept unpinned (>=10) for wheel compatibility on the target.
 dependencies = [
     "numpy==2.2.6",
     "opencv-python==4.12.0.88",
+    "Pillow>=10",
 ]
 
 [project.urls]
@@ -47,6 +51,11 @@ facelock-eval = "facelock.eval.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["facelock*"]
+
+# Ship the bundled Inter typeface + its SIL Open Font License in the wheel so the
+# premium enrollment UI has crisp typography on a bare machine (design G1).
+[tool.setuptools.package-data]
+facelock = ["assets/fonts/*.otf", "assets/fonts/*.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
