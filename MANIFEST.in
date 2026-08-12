@@ -1,10 +1,13 @@
 include README.md
+include CHANGELOG.md
 include LICENSE
 include requirements.txt
 recursive-include config *.toml
 recursive-include systemd *.service
 recursive-include scripts *.sh
+include scripts/models.sha256
 recursive-include docs *.md
+recursive-include facelock/assets *.otf *.txt
 include models/.gitkeep
 global-exclude __pycache__
 global-exclude *.py[cod]

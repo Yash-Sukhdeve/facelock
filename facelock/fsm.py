@@ -96,7 +96,7 @@ class FSMConfig:
     challenge_timeout_s: float = 4.0
     probe_frames: int = 5  # k-of-n window size (n); reject only after a full window
     verify_timeout_s: float = 3.0  # bound VERIFYING so flicker cannot hang it
-    owner_name: str = "Yash"
+    owner_name: str = "User"
 
 
 class PresenceStateMachine:

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "facelock"
-version = "0.1.0"
-description = "Screensaver-only face-unlock prototype (fail-closed, CPU-only, local)"
+version = "0.2.0"
+description = "Screensaver-class local face-unlock (fail-closed, CPU-only, RGB, no PAM)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -23,9 +23,13 @@ classifiers = [
 
 # Pinned to the verified target platform (REQ-NF-21/26). tomllib is stdlib.
 # numpy 2.x is required by the opencv-python 4.12 pip wheel (see requirements.txt).
+# Pillow renders the bundled Inter typeface in the enrollment UI; render() falls
+# back to cv2.putText (Hershey) if Pillow/fonts are unavailable, so it is a soft
+# runtime need -- kept unpinned (>=10) for wheel compatibility on the target.
 dependencies = [
     "numpy==2.2.6",
     "opencv-python==4.12.0.88",
+    "Pillow>=10",
 ]
 
 [project.urls]
@@ -42,10 +46,24 @@ test = ["pytest>=8,<10"]
 facelock = "facelock.cli:main"
 facelockd = "facelock.daemon:main"
 facelock-guardian = "facelock.guardian:main"
+facelock-eval = "facelock.eval.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["facelock*"]
+
+# Ship the bundled Inter typeface + its SIL Open Font License in the wheel so the
+# premium enrollment UI has crisp typography on a bare machine (design G1).
+[tool.setuptools.package-data]
+facelock = ["assets/fonts/*.otf", "assets/fonts/*.txt"]
+
+# Ship the default config + the systemd --user units in the wheel so a bare
+# `pipx install facelock` gives `facelock setup` the files it needs. They land
+# under <sys.prefix>/config and <sys.prefix>/systemd on install; setup_cmd
+# resolves them there (or from the repo root in a source checkout).
+[tool.setuptools.data-files]
+"config" = ["config/facelock.toml"]
+"systemd" = ["systemd/facelockd.service", "systemd/facelock-guardian.service"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

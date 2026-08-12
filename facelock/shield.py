@@ -48,7 +48,7 @@ class ShieldWindow:
 
     def __init__(
         self,
-        owner_name: str = "Yash",
+        owner_name: str = "User",
         *,
         on_password_escape: Callable[[], None] | None = None,
     ) -> None:

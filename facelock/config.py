@@ -19,6 +19,7 @@ read e.g. ``cfg.recognition.tau`` / ``cfg.stranger.policy``.
 
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -203,6 +204,10 @@ SCHEMA: tuple[Field, ...] = (
     Field("liveness", "challenge_timeout_s", v_int(1, 15), 4, _UNSET, req="REQ-F-19,FM-04"),
     Field("liveness", "pad_model_path", v_str, "", _UNSET, req="REQ-NF-11"),
     Field("liveness", "pad_threshold", v_float(0.0, 1.0), 0.5, _UNSET, req="REQ-NF-11"),
+    # Passive-PAD temporal quorum (k): frames in a burst that must INDEPENDENTLY
+    # clear pad_threshold before a live verdict (k-of-n, mirrors match_votes).
+    # Replaces max-across-frames aggregation (I2, fail-closed on the time axis).
+    Field("liveness", "pad_min_live_frames", v_int(1, 15), 3, _UNSET, req="REQ-NF-11,FM-03"),
     Field("liveness", "turn_yaw_deg", v_float(5.0, 60.0), 15.0, _UNSET, req="REQ-F-19"),
     # lock
     Field("lock", "backend", v_enum("auto", "gnome_dbus", "loginctl", "xdg"), "auto", _UNSET, req="REQ-F-13,NF-19"),
@@ -218,7 +223,7 @@ SCHEMA: tuple[Field, ...] = (
     # unlock
     Field("unlock", "max_fail_attempts", v_int(1, 20), 5, _UNSET, req="REQ-F-25,ASM-11"),
     Field("unlock", "cooldown_s", v_int(5, 600), 30, _UNSET, req="REQ-F-25,FM-15"),
-    Field("unlock", "owner_name", v_nonempty_str, "Yash", _UNSET, req="REQ-F-15,ASM-01"),
+    Field("unlock", "owner_name", v_nonempty_str, "User", _UNSET, req="REQ-F-15,ASM-01"),
     Field("unlock", "greeting", v_bool, True, _UNSET, req="REQ-F-15"),
     # On unlock, hold a "Welcome back" splash on the shield this long before it
     # dismisses (0 = dismiss instantly). Small by default to keep unlock snappy.
@@ -481,3 +486,69 @@ def load_config(source: Path | str | None = None, *, raw: dict[str, Any] | None 
         source_path=source_path,
         phase=phase,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Targeted config write-back: enroll --name -> config.toml (REQ-F-15).
+# --------------------------------------------------------------------------- #
+# Matches the ``owner_name = "<value>"`` assignment (any leading indent), up to
+# but NOT including any trailing whitespace/inline comment, so those survive
+# untouched. Scoped to a section body slice by the caller -- never matches
+# outside ``[unlock]`` (e.g. a same-named key in a different table).
+_UNLOCK_OWNER_NAME_RE = re.compile(r'(?m)^(?P<prefix>[ \t]*owner_name[ \t]*=[ \t]*)"(?:[^"\\]|\\.)*"')
+_SECTION_HEADER_RE = re.compile(r'(?m)^\[(?P<name>[^\]]+)\]\s*$')
+
+
+def update_owner_name(path: Path, name: str) -> tuple[bool, str]:
+    """Rewrite ``[unlock] owner_name`` in an EXISTING ``config.toml`` in place.
+
+    Persists ``facelock enroll --name <name>`` so the runtime "Welcome back"
+    greeting (``guardian.py`` / ``fsm.py``, which read
+    ``config.unlock.owner_name``) matches the enrolled owner instead of the
+    shipped/code default (REQ-F-15). Only the ``owner_name`` value inside the
+    ``[unlock]`` table is touched -- every other key, comment, and blank line
+    in the file is preserved byte-for-byte. The file is rewritten atomically
+    at mode 0600 via :func:`paths.secure_write_bytes`.
+
+    This function NEVER raises. It returns ``(success, message)`` so callers
+    -- notably :class:`~facelock.enroll.EnrollmentTool` -- can warn and
+    continue rather than aborting an otherwise-successful enrollment over a
+    config-write hiccup. This is a deliberately FAIL-SAFE (not fail-closed)
+    path: a stale greeting name is a cosmetic issue, not a security one (the
+    security-critical config keys are unaffected and still fail-closed via
+    :func:`load_config`).
+    """
+    from . import paths as _paths
+
+    try:
+        if not path.exists():
+            return False, f"config not found at {path}; owner_name not persisted"
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return False, f"could not read config {path}: {exc}"
+
+    headers = list(_SECTION_HEADER_RE.finditer(text))
+    body_start: int | None = None
+    body_end = len(text)
+    for i, m in enumerate(headers):
+        if m.group("name").strip() == "unlock":
+            body_start = m.end()
+            body_end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
+            break
+    if body_start is None:
+        return False, f"config {path} has no [unlock] section; owner_name not updated"
+
+    body = text[body_start:body_end]
+    escaped = name.replace("\\", "\\\\").replace('"', '\\"')
+    new_body, count = _UNLOCK_OWNER_NAME_RE.subn(
+        lambda m: f'{m.group("prefix")}"{escaped}"', body, count=1,
+    )
+    if count == 0:
+        return False, f"config {path} [unlock] section has no owner_name key; not updated"
+
+    new_text = text[:body_start] + new_body + text[body_end:]
+    try:
+        _paths.secure_write_bytes(path, new_text.encode("utf-8"), 0o600)
+    except OSError as exc:
+        return False, f"could not write config {path}: {exc}"
+    return True, f"owner_name updated to {name!r} in {path}"

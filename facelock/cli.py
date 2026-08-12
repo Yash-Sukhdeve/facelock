@@ -90,6 +90,8 @@ def cmd_enroll(args: argparse.Namespace) -> int:
         gui=not args.no_gui,
         settle_s=args.settle_seconds,
         capture_interval_s=args.interval_seconds,
+        screen=args.screen,
+        windowed=args.windowed,
     )
 
 
@@ -198,6 +200,25 @@ def cmd_config_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_setup(args: argparse.Namespace) -> int:
+    """Provision models (SHA-pinned) + config (+ optional systemd units).
+
+    Fresh-machine step between install and enroll. Fail-closed on a model hash
+    mismatch. Never enables auto-start (enroll first). See ``setup_cmd``.
+    """
+    from . import setup_cmd
+
+    try:
+        setup_cmd.run_setup(systemd=bool(args.systemd))
+    except setup_cmd.SetupError as exc:
+        print(f"setup failed: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"setup failed: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
 def cmd_test(args: argparse.Namespace) -> int:
     """Camera + pipeline self-test: fps, per-frame latency, score vs tau."""
     try:
@@ -293,8 +314,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, default=None, help="path to config.toml")
     sub = parser.add_subparsers(dest="verb", required=True)
 
+    p_setup = sub.add_parser(
+        "setup", help="download SHA-pinned models + install config (run once after install)")
+    p_setup.add_argument("--systemd", action="store_true",
+                         help="also install the --user systemd units (does NOT enable auto-start)")
+    p_setup.set_defaults(func=cmd_setup)
+
     p_enroll = sub.add_parser("enroll", help="enroll or re-enroll the owner face")
-    p_enroll.add_argument("--name", default="Yash", help="owner display name (greeting)")
+    p_enroll.add_argument("--name", default="User", help="owner display name (greeting)")
     p_enroll.add_argument("--augment", action="store_true", help="add to the existing template")
     p_enroll.add_argument("--samples-per-pose", type=int, default=3,
                           help="frames captured per guided head position (default 3)")
@@ -302,6 +329,11 @@ def build_parser() -> argparse.ArgumentParser:
                           help="legacy single-position capture (no guided multi-pose)")
     p_enroll.add_argument("--no-gui", action="store_true",
                           help="disable the graphical preview (text prompts only)")
+    p_enroll.add_argument("--screen", type=int, default=0,
+                          help="monitor index for the fullscreen preview "
+                               "(0-based; see 'xrandr --listmonitors', default 0)")
+    p_enroll.add_argument("--windowed", action="store_true",
+                          help="show the preview in a window instead of fullscreen")
     p_enroll.add_argument("--settle-seconds", type=float, default=2.5,
                           help="get-ready countdown before each pose (default 2.5)")
     p_enroll.add_argument("--interval-seconds", type=float, default=0.7,

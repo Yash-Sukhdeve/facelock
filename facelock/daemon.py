@@ -34,7 +34,7 @@ from .config import (
 from .control import DecisionEmitter
 from .errors import CameraError, ModelError, TemplateError
 from .fsm import FSMConfig, Observation, PresenceStateMachine, State
-from .liveness import LivenessEngine, LivenessObservation
+from .liveness import LivenessEngine, LivenessObservation, build_liveness_observation
 from .logging_setup import emit_dry_run_banner, event, get_logger
 from .matcher import Matcher
 from .store import TemplateStore
@@ -104,6 +104,7 @@ class PerceptionDaemon:
             turn_yaw_deg=config.liveness.turn_yaw_deg,
             pad_model_path=config.liveness.pad_model_path,
             pad_threshold=config.liveness.pad_threshold,
+            pad_min_live_frames=config.liveness.pad_min_live_frames,
         )
         self.fsm = PresenceStateMachine(FSMConfig(
             away_dwell_s=config.presence.away_dwell_s,
@@ -363,11 +364,12 @@ class PerceptionDaemon:
         if self.fsm.state != State.LIVENESS_CHALLENGE or not detections:
             return
         det = detections[0]
-        aligned = None
-        if self.liveness.mode in ("passive", "full") and self.embedder is not None:
-            aligned = self.embedder.align(frame.bgr, det)
-        self._challenge_obs.append(LivenessObservation(
-            landmarks=det.landmarks, ts=frame.ts_monotonic, aligned=aligned))
+        # PAD consumes a bbox-context crop (design 2.2, correction A1), NOT the
+        # SFace recognition warp; build it purely from the detector bbox so
+        # embedder.align stays recognition-only.
+        self._challenge_obs.append(
+            build_liveness_observation(frame.bgr, frame.ts_monotonic, det, self.liveness.mode)
+        )
 
     def _evaluate_challenge(self, now: float) -> Any:
         if self.fsm.state != State.LIVENESS_CHALLENGE:

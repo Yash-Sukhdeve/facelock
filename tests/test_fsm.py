@@ -262,3 +262,12 @@ def test_step_exception_forces_locked():
     tr = m.step(Observation(now=5.0, owner_visible=False))
     assert tr.new_state == State.LOCKED_ABSENT
     assert tr.emits[0].payload["reason"] == "error"
+
+
+def test_fsmconfig_owner_name_default_is_neutral_not_a_persons_name():
+    # Pre-publish fix: FSMConfig's shipped default must not be the author's
+    # name ("Yash") even though daemon.py always overrides it explicitly --
+    # a bare FSMConfig() must not carry someone else's name either.
+    cfg = FSMConfig()
+    assert cfg.owner_name == "User"
+    assert cfg.owner_name != "Yash"

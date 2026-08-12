@@ -76,7 +76,7 @@ verify_engaged_ms     = 500             # 100-3000 - confirm lock engaged   SI-P
 [unlock]
 max_fail_attempts     = 5               # 1-20 - then cooldown              REQ-F-25, ASM-11
 cooldown_s            = 30              # 5-600                            REQ-F-25, FM-15
-owner_name            = "Yash"          # greeting name                     REQ-F-15, ASM-01
+owner_name            = "User"          # greeting name                     REQ-F-15, ASM-01
 greeting              = true            # show "Welcome back, <name>"       REQ-F-15
 welcome_hold_s        = 0.6             # 0-3 - hold welcome splash on unlock; 0 = instant  REQ-F-15
 
