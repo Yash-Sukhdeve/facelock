@@ -5,6 +5,18 @@ All notable changes to facelock are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The
 version is single-sourced from `pyproject.toml`.
 
+## [0.2.1] - 2026-08-13
+
+CI-only patch: enable PyPI publishing via **Trusted Publishing** (OIDC, no
+stored token). The package code is **identical to 0.2.0** — this release exists
+so a version tag carries the OIDC-based release workflow. This is the first
+version published to PyPI, so `pipx install facelock` (by name) works from here.
+
+### Changed
+- `.github/workflows/release.yml` publishes to PyPI via OIDC Trusted Publishing
+  instead of an API-token secret (adds `id-token: write`; removes the token
+  gate). The GitHub Release step is unchanged and still runs first.
+
 ## [0.2.0] - 2026-08-12
 
 First packaged, installable release: `pipx install facelock` → `facelock setup`

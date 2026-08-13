@@ -42,7 +42,7 @@ try:
 
     __version__ = _pkg_version("facelock")
 except PackageNotFoundError:  # pragma: no cover - source tree without install
-    __version__ = "0.2.0"
+    __version__ = "0.2.1"
 
 # REQ-F-17 / AC-F-17: the exact disclosure shown on first run and in the README.
 PROTOTYPE_SPOOF_DISCLOSURE = (
