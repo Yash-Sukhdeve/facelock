@@ -68,10 +68,13 @@ layer, **not** a certified biometric.
 ## Install (pipx — recommended)
 
 ```bash
-pipx install facelock     # or: ./scripts/install-pipx.sh
-facelock setup            # downloads the SHA-pinned models + installs the config
+pipx install facelock-linux   # or: ./scripts/install-pipx.sh
+facelock setup                # downloads the SHA-pinned models + installs the config
 facelock enroll --name <YourName>
 ```
+
+> The PyPI **package** is `facelock-linux` (the bare `facelock` name belongs to an
+> unrelated project); the **command** you run is still `facelock`.
 
 `facelock setup` fetches the **SHA-256-pinned** YuNet + SFace models from the
 OpenCV Zoo into `~/.local/share/facelock/models` (verifying each hash and
@@ -95,7 +98,7 @@ Download the wheel from the [Releases page](https://github.com/Yash-Sukhdeve/fac
 then:
 
 ```bash
-pipx install ./facelock-0.2.0-py3-none-any.whl
+pipx install ./facelock_linux-*.whl
 facelock setup
 facelock enroll --name <YourName>
 ```

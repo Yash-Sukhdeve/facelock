@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install-pipx.sh -- one-line install via pipx, then provision.
 #
-#   pipx install facelock  ->  facelock setup  ->  facelock enroll
+#   pipx install facelock-linux  ->  facelock setup  ->  facelock enroll
 #
 # Ensures pipx is available (user-space), installs facelock into its own
 # isolated venv, then runs `facelock setup` to fetch the SHA-pinned models and
@@ -10,7 +10,7 @@
 # be cleared with your OS password). Runs entirely as the unprivileged user.
 #
 # Usage:
-#   scripts/install-pipx.sh            # install from PyPI: pipx install facelock
+#   scripts/install-pipx.sh            # install from PyPI: pipx install facelock-linux
 #   scripts/install-pipx.sh --local    # install this checkout: pipx install .
 #   scripts/install-pipx.sh --systemd  # also install the --user systemd units
 set -euo pipefail
@@ -20,7 +20,7 @@ if [[ "$(id -u)" -eq 0 ]]; then
   exit 1
 fi
 
-SOURCE_SPEC="facelock"     # default: install the published package from PyPI
+SOURCE_SPEC="facelock-linux"   # default: install the published package from PyPI (command is still `facelock`)
 WITH_SYSTEMD=0
 for arg in "$@"; do
   case "$arg" in

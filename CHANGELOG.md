@@ -7,19 +7,24 @@ version is single-sourced from `pyproject.toml`.
 
 ## [0.2.1] - 2026-08-13
 
-CI-only patch: enable PyPI publishing via **Trusted Publishing** (OIDC, no
-stored token). The package code is **identical to 0.2.0** — this release exists
-so a version tag carries the OIDC-based release workflow. This is the first
-version published to PyPI, so `pipx install facelock` (by name) works from here.
+CI-only patch: publish to PyPI. The package code is **identical to 0.2.0** —
+this release exists so a version tag carries the PyPI release workflow.
+
+The PyPI **distribution name is `facelock-linux`** (the bare `facelock` name on
+PyPI belongs to an unrelated project). Install with `pipx install facelock-linux`;
+the **command and import are still `facelock`**. Publishing uses **Trusted
+Publishing** (OIDC) — no API token is stored anywhere.
 
 ### Changed
+- `[project].name` is `facelock-linux` for PyPI; the import package, the
+  `facelock` command, and all console scripts are unchanged.
 - `.github/workflows/release.yml` publishes to PyPI via OIDC Trusted Publishing
   instead of an API-token secret (adds `id-token: write`; removes the token
   gate). The GitHub Release step is unchanged and still runs first.
 
 ## [0.2.0] - 2026-08-12
 
-First packaged, installable release: `pipx install facelock` → `facelock setup`
+First packaged, installable release: `pipx install facelock-linux` → `facelock setup`
 → `facelock enroll` works on a fresh machine.
 
 ### Added
@@ -61,7 +66,7 @@ First packaged, installable release: `pipx install facelock` → `facelock setup
 ### Changed
 - Version bumped to **0.2.0**; `__version__` is now read from the installed
   package metadata (single source of truth = `pyproject.toml`).
-- Install docs rewritten around `pipx install facelock` → `facelock setup` →
+- Install docs rewritten around `pipx install facelock-linux` → `facelock setup` →
   `facelock enroll`, with an honestly-scoped recognition-metrics line.
 - Security contract: the runtime unlock path remains network-free (REQ-NF-12);
   the one-shot `setup` provisioning verb is the single, tested exception, and a
